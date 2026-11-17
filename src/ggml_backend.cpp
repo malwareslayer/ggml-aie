@@ -106,7 +106,7 @@ OllamaBuffer* ollama_buf(ggml_backend_buffer_t buffer) {
 
 std::shared_ptr<XrtOpsRunner> get_ops() {
     const char* env = std::getenv("AIE2_XRT_OPS_DIR");
-    std::string ops_dir = (env && *env) ? env : "/usr/share/ollama-aie2/kernel";
+    std::string ops_dir = (env && *env) ? env : "/usr/share/ggml-aie/kernel";
     const std::scoped_lock guard(state.init_lock);
     if (!state.ops && !state.init_attempted) {
         state.init_attempted = true;
@@ -214,6 +214,8 @@ constexpr int kOpGlu = 101;
 struct PackedWeight {
     std::vector<float> data;
     std::vector<uint16_t> data_bf16;
+    std::vector<xrt::bo> slice_bos;
+    size_t bo_bytes = 0;
     bool is_bf16 = false;
     int64_t n_blocks = 0;
     int64_t k_blocks = 0;
@@ -225,12 +227,15 @@ struct ggml_backend_aie2_buffer {
     void* base = nullptr;
     size_t size = 0;
     size_t prepacked_bytes = 0;
+    size_t bo_weight_bytes = 0;
     std::mutex pack_mu;
     std::unordered_map<const void*, PackedWeight> packed_weights;
 };
 
 std::atomic<size_t> g_total_prepack_bytes{0};
-constexpr size_t kMaxPrepackBytes = 1024ULL * 1024ULL * 1024ULL; // 1 GiB cap for F32 pre-pack cache
+std::atomic<size_t> g_total_bo_weight_bytes{0};
+constexpr size_t kMaxPrepackBytes = 1024ULL * 1024ULL * 1024ULL; // 1 GiB cap for F32/BF16 pre-pack
+constexpr size_t kMaxBoWeightBytes = 256ULL * 1024ULL * 1024ULL; // 256 MiB cap for pinned XRT BOs
 
 ggml_backend_aie2_buffer* get_aie2_buffer(const struct ggml_tensor* t) {
     if (!t) {
@@ -249,6 +254,9 @@ void ggml_backend_aie2_buffer_free(ggml_backend_buffer_t buffer) {
     if (ctx) {
         if (ctx->prepacked_bytes > 0) {
             g_total_prepack_bytes.fetch_sub(ctx->prepacked_bytes, std::memory_order_relaxed);
+        }
+        if (ctx->bo_weight_bytes > 0) {
+            g_total_bo_weight_bytes.fetch_sub(ctx->bo_weight_bytes, std::memory_order_relaxed);
         }
         std::free(ctx->base);
         delete ctx;
@@ -352,10 +360,40 @@ void ggml_backend_aie2_buffer_set_tensor(ggml_backend_buffer_t buffer, struct gg
         const auto t1 = std::chrono::steady_clock::now();
         mgr.add_prepack_ns(std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count());
 
+        const size_t cur_bo = g_total_bo_weight_bytes.load(std::memory_order_relaxed);
+        if (cur_bo + packed_bytes <= kMaxBoWeightBytes) {
+            try {
+                const std::scoped_lock xrt_lock(mgr.mutex());
+                const auto& prog = mgr.slot(Aie2OpKind::kGemmBf16);
+                const auto n_slices_total = static_cast<size_t>(n_slices * k_slices);
+                const size_t slice_bytes = kSliceElems * sizeof(uint16_t);
+                const int grp = prog.kernel.group_id(4);
+                pw.slice_bos.reserve(n_slices_total);
+                for (size_t s = 0; s < n_slices_total; ++s) {
+                    xrt::bo bo(mgr.device(), slice_bytes, xrt::bo::flags::host_only, grp);
+                    std::memcpy(bo.map<void*>(), pw.data_bf16.data() + (s * kSliceElems),
+                                slice_bytes);
+                    bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+                    pw.slice_bos.push_back(std::move(bo));
+                }
+                pw.bo_bytes = packed_bytes;
+                pw.data_bf16.clear();
+                pw.data_bf16.shrink_to_fit();
+            } catch (const std::exception&) {
+                pw.slice_bos.clear();
+                pw.bo_bytes = 0;
+            }
+        }
+
         const std::scoped_lock lock(ctx->pack_mu);
         if (!ctx->packed_weights.contains(tensor->data)) {
-            ctx->prepacked_bytes += packed_bytes;
-            g_total_prepack_bytes.fetch_add(packed_bytes, std::memory_order_relaxed);
+            if (pw.bo_bytes > 0) {
+                ctx->bo_weight_bytes += pw.bo_bytes;
+                g_total_bo_weight_bytes.fetch_add(pw.bo_bytes, std::memory_order_relaxed);
+            } else {
+                ctx->prepacked_bytes += packed_bytes;
+                g_total_prepack_bytes.fetch_add(packed_bytes, std::memory_order_relaxed);
+            }
         }
         ctx->packed_weights[tensor->data] = std::move(pw);
     }
@@ -403,7 +441,7 @@ ggml_backend_buffer_t aie2_buft_alloc_buffer(ggml_backend_buffer_type_t buft, si
         std::fprintf(stderr, "aie2: buffer alloc failed (%zu bytes)\n", size);
         return nullptr;
     }
-    auto* ctx = new ggml_backend_aie2_buffer{base, alloc_bytes, 0, {}, {}};
+    auto* ctx = new ggml_backend_aie2_buffer{base, alloc_bytes, 0, 0, {}, {}};
     using BufferInitFn =
         ggml_backend_buffer_t (*)(ggml_backend_buffer_type_t, OllamaBufferI, void*, size_t);
     const auto init_fn = reinterpret_cast<BufferInitFn>(
@@ -896,9 +934,10 @@ ggml_status compute_node(ggml_tensor* node) {
                                                        (i2 * node->nb[2]) + (i3 * node->nb[3]));
                 if (pw) {
                     if (pw->is_bf16) {
-                        XrtOpsRunner::gemm_bf16_nt_prepacked(a_ptr, K, pw->data_bf16.data(),
-                                                             pw->n_blocks, pw->k_blocks, c_ptr, N,
-                                                             M, N, K);
+                        XrtOpsRunner::gemm_bf16_nt_prepacked(
+                            a_ptr, K, pw->data_bf16.data(),
+                            pw->slice_bos.empty() ? nullptr : &pw->slice_bos, pw->n_blocks,
+                            pw->k_blocks, c_ptr, N, M, N, K);
                     } else {
                         XrtOpsRunner::gemm_f32_nt_prepacked(a_ptr, K, pw->data.data(), pw->n_blocks,
                                                             pw->k_blocks, c_ptr, N, M, N, K);

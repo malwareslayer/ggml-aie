@@ -1,6 +1,6 @@
 # AUR metadata
 
-`PKGBUILD` and `.SRCINFO` for the `ollama-aie2` Arch Linux package.
+`PKGBUILD` and `.SRCINFO` for the `ggml-aie` Arch Linux package.
 
 After any metadata change in `PKGBUILD`, regenerate `.SRCINFO` from this directory:
 

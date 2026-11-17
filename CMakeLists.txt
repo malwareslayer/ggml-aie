@@ -1,10 +1,10 @@
 cmake_minimum_required(VERSION 3.24)
-project(ollama-aie2 VERSION 0.2.2 LANGUAGES CXX)
+project(ggml-aie VERSION 0.3.0 LANGUAGES CXX)
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-set(GGML_SOURCE_DIR "" CACHE PATH "GGML source matching Ollama 0.40.16 / llama.cpp b12177")
-set(OLLAMA_LIBRARY_DIR "/usr/lib/ollama" CACHE PATH "Pinned Ollama GGML runtime libraries")
+set(GGML_SOURCE_DIR "" CACHE PATH "GGML source matching ggml 0.29.0")
+set(GGML_LIBRARY_DIR "/usr/lib" CACHE PATH "System GGML runtime libraries")
 if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/CMakeLists.txt")
     message(FATAL_ERROR
         "The full-graph AIE2 backend is not implemented. "

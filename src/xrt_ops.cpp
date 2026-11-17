@@ -355,11 +355,12 @@ float bf16_to_f32(uint16_t b) {
 } // namespace
 
 void XrtOpsRunner::gemm_bf16_nt_prepacked(const float* a, int64_t lda, const uint16_t* b_packed,
-                                          int64_t n_slices, int64_t k_slices, float* c, int64_t ldc,
-                                          int64_t M, int64_t N, int64_t K) {
+                                          const void* b_bos_ptr, int64_t n_slices, int64_t k_slices,
+                                          float* c, int64_t ldc, int64_t M, int64_t N, int64_t K) {
     auto& mgr = XrtContextManager::instance();
     const std::scoped_lock lock(mgr.mutex());
     auto& prog = mgr.slot(Aie2OpKind::kGemmBf16);
+    const auto* b_bos = static_cast<const std::vector<xrt::bo>*>(b_bos_ptr);
 
     constexpr int64_t TM = kBf16TM;
     constexpr int64_t TK = kBf16TK;
@@ -414,10 +415,15 @@ void XrtOpsRunner::gemm_bf16_nt_prepacked(const float* a, int64_t lda, const uin
         for (int64_t ns = 0; ns < n_slices; ++ns) {
             const int64_t n_base = ns * TN;
             const int64_t nb = std::min<int64_t>(TN, N - n_base);
-            const uint16_t* b_src =
-                b_packed + (static_cast<size_t>((ns * k_slices) + ks) * kBSliceElems);
-            std::memcpy(b_buf, b_src, kBSliceElems * sizeof(uint16_t));
-            mgr.timed_sync(bo_b, XCL_BO_SYNC_BO_TO_DEVICE);
+            const auto slice_idx = static_cast<size_t>((ns * k_slices) + ks);
+            const bool use_persistent_bo = b_bos && slice_idx < b_bos->size();
+            xrt::bo& active_bo_b =
+                use_persistent_bo ? const_cast<xrt::bo&>((*b_bos)[slice_idx]) : bo_b;
+            if (!use_persistent_bo) {
+                const uint16_t* b_src = b_packed + (slice_idx * kBSliceElems);
+                std::memcpy(b_buf, b_src, kBSliceElems * sizeof(uint16_t));
+                mgr.timed_sync(bo_b, XCL_BO_SYNC_BO_TO_DEVICE);
+            }
 
             const int64_t active_w = (nb + TNW - 1) / TNW;
             for (int64_t ms = 0; ms < m_strips; ++ms) {
@@ -427,7 +433,7 @@ void XrtOpsRunner::gemm_bf16_nt_prepacked(const float* a, int64_t lda, const uin
                     a_packed.data() + (static_cast<size_t>(ms) * kASliceElems);
                 std::memcpy(a_buf, a_strip, kASliceElems * sizeof(uint16_t));
                 mgr.timed_sync(bo_a, XCL_BO_SYNC_BO_TO_DEVICE);
-                mgr.timed_run_wait(prog, bo_a, bo_b, bo_c);
+                mgr.timed_run_wait(prog, bo_a, active_bo_b, bo_c);
                 mgr.timed_sync(bo_c, XCL_BO_SYNC_BO_FROM_DEVICE);
 
                 for (int64_t w = 0; w < active_w; ++w) {

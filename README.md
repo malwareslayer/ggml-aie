@@ -1,10 +1,10 @@
-# ollama-aie2
+# ggml-aie
 
-Native GGML dynamic backend (`libggml-aie2.so`) for **AMD Phoenix / XDNA1 AIE2 NPU** (`/dev/accel/accel0`) via XRT, targeting encoder, embedding, and reranker workloads in Ollama.
+Native GGML dynamic backend (`libggml-aie.so`) for **AMD Phoenix / XDNA1 AIE2 NPU** (`/dev/accel/accel0`) via XRT, targeting encoder, embedding, reranker, and hybrid prefill workloads in GGML / `llama-server` / Ollama.
 
 ## Architecture & Capabilities
 
-`ollama-aie2` implements the GGML Backend API v3 (`GGML_BACKEND_DL`) and dispatches supported tensor operations onto compiled AIE2 XCLBIN kernels (`NPU1Col1`) through `xrt_coreutil`:
+`ggml-aie` implements the GGML Backend API v3 (`GGML_BACKEND_DL`) and dispatches supported tensor operations onto compiled AIE2 XCLBIN kernels (`NPU1` 4-column `BF16` `aie::mmul<4,8,8>` + `NPU1Col1` `F32` ops) through `xrt_coreutil`:
 
 - **AIE2 XRT Kernels (`src/device/*.cc`)**
   - `gemm_f32`: 32x32x32 tiled `F32` matrix multiplication (`GGML_OP_MUL_MAT`)
@@ -26,7 +26,7 @@ Unsupported ops or shapes outside AIE2 kernel limits return `false` in `supports
 
 | Path | Description |
 | --- | --- |
-| `src/` | C++20 GGML backend (`ggml_backend.cpp`), XRT runners (`xrt_*`), symbol version script (`ggml-aie2.ver`), and AIE2 device kernels (`src/device/*.cc`) |
+| `src/` | C++20 GGML backend (`ggml_backend.cpp`), XRT runners (`xrt_*`), symbol version script (`ggml-aie.ver`), and AIE2 device kernels (`src/device/*.cc`) |
 | `scripts/build_kernels.py` | MLIR-AIE (`aie.iron`) build script compiling `src/device/*.cc` into `.xclbin` + `insts.bin` |
 | `packaging/aur/` | Arch Linux `PKGBUILD` |
 | `.clang-format`, `.clang-tidy` | Formatting and static analysis rules (`-std=c++20 -Wall -Wextra -Werror`) |
@@ -47,10 +47,10 @@ cmake -S . -B build -G Ninja \
   -DGGML_SOURCE_DIR=/path/to/llama.cpp/ggml \
   -DOLLAMA_LIBRARY_DIR=/usr/lib/ollama \
   -DCMAKE_BUILD_TYPE=Release
-cmake --build build --target ggml-aie2 -j
+cmake --build build --target ggml-aie -j
 ```
 
-Output: `build/libggml-aie2.so` (exports only `ggml_backend_init` via `src/ggml-aie2.ver`).
+Output: `build/libggml-aie.so` (exports only `ggml_backend_init` via `src/ggml-aie.ver`).
 
 ### 2. Compile AIE2 Device Kernels
 
@@ -69,9 +69,9 @@ Each operator produces `<op>/<op>.xclbin` and `<op>/insts.bin`.
 Install the backend library and compiled operator kernels to the default system paths:
 
 ```bash
-sudo install -Dm755 build/libggml-aie2.so /usr/lib/ollama/libggml-aie2.so
-sudo mkdir -p /usr/share/ollama-aie2/kernel
-# Copy each compiled <op>/ directory containing <op>.xclbin and insts.bin into /usr/share/ollama-aie2/kernel/
+sudo install -Dm755 build/libggml-aie.so /usr/lib/ggml/libggml-aie.so
+sudo mkdir -p /usr/share/ggml-aie/kernel
+# Copy each compiled <op>/ directory containing <op>.xclbin and insts.bin into /usr/share/ggml-aie/kernel/
 ```
 
 Configure Ollama (e.g. via a systemd drop-in):
@@ -79,14 +79,14 @@ Configure Ollama (e.g. via a systemd drop-in):
 ```ini
 [Service]
 LimitMEMLOCK=512M
-Environment=GGML_BACKEND_PATH=/usr/lib/ollama/libggml-aie2.so
+Environment=GGML_BACKEND_PATH=/usr/lib/ggml/libggml-aie.so
 ```
 
 ### Environment Variables
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `AIE2_XRT_OPS_DIR` | `/usr/share/ollama-aie2/kernel` | Override directory containing compiled `<op>/<op>.xclbin` and `<op>/insts.bin` |
+| `AIE2_XRT_OPS_DIR` | `/usr/share/ggml-aie/kernel` | Override directory containing compiled `<op>/<op>.xclbin` and `<op>/insts.bin` |
 | `AIE2_TRACE` | unset | Set to any value to log dispatched GGML graph nodes to `stderr` |
 
 ## Development & Linting
