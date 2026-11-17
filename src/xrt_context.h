@@ -86,6 +86,9 @@ class XrtContextManager {
     void add_prepack_ns(int64_t ns) {
         prepack_ns_.fetch_add(ns, std::memory_order_relaxed);
     }
+    void add_kernel_ns(int64_t ns) {
+        kernel_ns_.fetch_add(ns, std::memory_order_relaxed);
+    }
 
     [[nodiscard]] int64_t prepack_ns() const {
         return prepack_ns_.load(std::memory_order_relaxed);

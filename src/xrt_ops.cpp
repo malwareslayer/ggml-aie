@@ -2,7 +2,11 @@
 
 #include "xrt_context.h"
 
+#include <xrt/experimental/xrt_kernel.h>
+
 #include <algorithm>
+#include <array>
+#include <chrono>
 #include <cstring>
 #include <stdexcept>
 #include <utility>
@@ -374,16 +378,94 @@ void XrtOpsRunner::gemm_bf16_nt_prepacked(const float* a, int64_t lda, const uin
     constexpr auto kBTileElems = static_cast<size_t>(TNW * TK);
     constexpr auto kBSliceElems = static_cast<size_t>(NW * KChunks) * kBTileElems;
 
-    auto* a_buf = prog.arg_ptr<uint16_t>(0);
+    constexpr size_t kMaxStripA = 8;
+    constexpr size_t kRunBatch = 16;
+
+    struct Bf16RunPool {
+        bool ready = false;
+        std::array<xrt::bo, kMaxStripA> bo_a;
+        std::array<uint16_t*, kMaxStripA> a_ptr{};
+        std::array<xrt::bo, kRunBatch> bo_c;
+        std::array<uint16_t*, kRunBatch> c_ptr{};
+        std::array<xrt::run, kRunBatch> runs;
+
+        void ensure(XrtContextManager& m, XrtContextManager::ProgramSlot& p) {
+            if (ready) {
+                return;
+            }
+            const size_t a_bytes = kASliceElems * sizeof(uint16_t);
+            const size_t c_bytes = kASliceElems * sizeof(uint16_t);
+            const int grp_a = p.kernel.group_id(3);
+            const int grp_c = p.kernel.group_id(5);
+            for (size_t i = 0; i < kMaxStripA; ++i) {
+                bo_a[i] = xrt::bo(m.device(), a_bytes, xrt::bo::flags::host_only, grp_a);
+                a_ptr[i] = bo_a[i].map<uint16_t*>();
+            }
+            for (size_t i = 0; i < kRunBatch; ++i) {
+                bo_c[i] = xrt::bo(m.device(), c_bytes, xrt::bo::flags::host_only, grp_c);
+                c_ptr[i] = bo_c[i].map<uint16_t*>();
+                runs[i] = xrt::run(p.kernel);
+                runs[i].set_arg(0, 3U);
+                runs[i].set_arg(1, p.insts_bo);
+                runs[i].set_arg(2, p.insts_count);
+                runs[i].set_arg(5, bo_c[i]);
+            }
+            ready = true;
+        }
+    };
+    static Bf16RunPool pool;
+    pool.ensure(mgr, prog);
+
     auto* b_buf = prog.arg_ptr<uint16_t>(1);
-    const auto* c_buf = prog.arg_ptr<uint16_t>(2);
-    auto& bo_a = prog.arg_bo(0);
     auto& bo_b = prog.arg_bo(1);
-    auto& bo_c = prog.arg_bo(2);
 
     std::vector<float> accum(static_cast<size_t>(M * N), 0.0f);
     const int64_t m_strips = (M + TM - 1) / TM;
     std::vector<uint16_t> a_packed(static_cast<size_t>(m_strips) * kASliceElems);
+
+    struct PendingTile {
+        int64_t n_base = 0;
+        int64_t nb = 0;
+        int64_t m0 = 0;
+        int64_t mb = 0;
+        size_t slot = 0;
+    };
+    std::vector<PendingTile> pending;
+    pending.reserve(kRunBatch);
+
+    const auto flush_batch = [&](xrt::runlist& rl) {
+        if (pending.empty()) {
+            return;
+        }
+        const auto t0 = std::chrono::steady_clock::now();
+        rl.execute();
+        rl.wait();
+        const auto t1 = std::chrono::steady_clock::now();
+        mgr.add_kernel_ns(std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count());
+
+        for (const auto& t : pending) {
+            mgr.timed_sync(pool.bo_c[t.slot], XCL_BO_SYNC_BO_FROM_DEVICE);
+            const uint16_t* c_buf = pool.c_ptr[t.slot];
+            const int64_t active_w = (t.nb + TNW - 1) / TNW;
+            for (int64_t w = 0; w < active_w; ++w) {
+                const int64_t wn0 = t.n_base + (w * TNW);
+                const int64_t wnb = std::min<int64_t>(TNW, N - wn0);
+                const uint16_t* cw = c_buf + (static_cast<size_t>(w) * kATileElems);
+                for (int64_t m = 0; m < t.mb; ++m) {
+                    const int64_t m4 = m / 4;
+                    const int64_t r = m % 4;
+                    float* acc_row = accum.data() + ((t.m0 + m) * N) + wn0;
+                    for (int64_t n = 0; n < wnb; ++n) {
+                        const int64_t n8 = n / 8;
+                        const int64_t c8 = n % 8;
+                        acc_row[n] += bf16_to_f32(cw[(((m4 * 8) + n8) * 32) + (r * 8) + c8]);
+                    }
+                }
+            }
+        }
+        pending.clear();
+        rl = xrt::runlist(prog.hw_ctx);
+    };
 
     for (int64_t ks = 0; ks < k_slices; ++ks) {
         const int64_t k_base = ks * KSlice;
@@ -412,46 +494,53 @@ void XrtOpsRunner::gemm_bf16_nt_prepacked(const float* a, int64_t lda, const uin
             }
         }
 
-        for (int64_t ns = 0; ns < n_slices; ++ns) {
-            const int64_t n_base = ns * TN;
-            const int64_t nb = std::min<int64_t>(TN, N - n_base);
-            const auto slice_idx = static_cast<size_t>((ns * k_slices) + ks);
-            const bool use_persistent_bo = b_bos && slice_idx < b_bos->size();
-            xrt::bo& active_bo_b =
-                use_persistent_bo ? const_cast<xrt::bo&>((*b_bos)[slice_idx]) : bo_b;
-            if (!use_persistent_bo) {
-                const uint16_t* b_src = b_packed + (slice_idx * kBSliceElems);
-                std::memcpy(b_buf, b_src, kBSliceElems * sizeof(uint16_t));
-                mgr.timed_sync(bo_b, XCL_BO_SYNC_BO_TO_DEVICE);
-            }
-
-            const int64_t active_w = (nb + TNW - 1) / TNW;
-            for (int64_t ms = 0; ms < m_strips; ++ms) {
-                const int64_t m0 = ms * TM;
-                const int64_t mb = std::min<int64_t>(TM, M - m0);
+        for (int64_t m_base = 0; m_base < m_strips; m_base += static_cast<int64_t>(kMaxStripA)) {
+            const int64_t m_end =
+                std::min<int64_t>(m_strips, m_base + static_cast<int64_t>(kMaxStripA));
+            for (int64_t ms = m_base; ms < m_end; ++ms) {
+                const size_t a_slot = static_cast<size_t>(ms - m_base);
                 const uint16_t* a_strip =
                     a_packed.data() + (static_cast<size_t>(ms) * kASliceElems);
-                std::memcpy(a_buf, a_strip, kASliceElems * sizeof(uint16_t));
-                mgr.timed_sync(bo_a, XCL_BO_SYNC_BO_TO_DEVICE);
-                mgr.timed_run_wait(prog, bo_a, active_bo_b, bo_c);
-                mgr.timed_sync(bo_c, XCL_BO_SYNC_BO_FROM_DEVICE);
+                std::memcpy(pool.a_ptr[a_slot], a_strip, kASliceElems * sizeof(uint16_t));
+                mgr.timed_sync(pool.bo_a[a_slot], XCL_BO_SYNC_BO_TO_DEVICE);
+            }
 
-                for (int64_t w = 0; w < active_w; ++w) {
-                    const int64_t wn0 = n_base + (w * TNW);
-                    const int64_t wnb = std::min<int64_t>(TNW, N - wn0);
-                    const uint16_t* cw = c_buf + (static_cast<size_t>(w) * kATileElems);
-                    for (int64_t m = 0; m < mb; ++m) {
-                        const int64_t m4 = m / 4;
-                        const int64_t r = m % 4;
-                        float* acc_row = accum.data() + ((m0 + m) * N) + wn0;
-                        for (int64_t n = 0; n < wnb; ++n) {
-                            const int64_t n8 = n / 8;
-                            const int64_t c8 = n % 8;
-                            acc_row[n] += bf16_to_f32(cw[(((m4 * 8) + n8) * 32) + (r * 8) + c8]);
-                        }
+            xrt::runlist rl(prog.hw_ctx);
+            for (int64_t ns = 0; ns < n_slices; ++ns) {
+                const int64_t n_base = ns * TN;
+                const int64_t nb = std::min<int64_t>(TN, N - n_base);
+                const auto slice_idx = static_cast<size_t>((ns * k_slices) + ks);
+                const bool use_persistent_bo = b_bos && slice_idx < b_bos->size();
+                xrt::bo& active_bo_b =
+                    use_persistent_bo ? const_cast<xrt::bo&>((*b_bos)[slice_idx]) : bo_b;
+                if (!use_persistent_bo) {
+                    // Shared scratch bo_b must complete any prior runs before overwriting.
+                    flush_batch(rl);
+                    const uint16_t* b_src = b_packed + (slice_idx * kBSliceElems);
+                    std::memcpy(b_buf, b_src, kBSliceElems * sizeof(uint16_t));
+                    mgr.timed_sync(bo_b, XCL_BO_SYNC_BO_TO_DEVICE);
+                }
+
+                for (int64_t ms = m_base; ms < m_end; ++ms) {
+                    const size_t a_slot = static_cast<size_t>(ms - m_base);
+                    const size_t slot = pending.size();
+                    auto& r = pool.runs[slot];
+                    r.set_arg(3, pool.bo_a[a_slot]);
+                    r.set_arg(4, active_bo_b);
+                    rl.add(r);
+
+                    const int64_t m0 = ms * TM;
+                    const int64_t mb = std::min<int64_t>(TM, M - m0);
+                    pending.push_back({n_base, nb, m0, mb, slot});
+                    if (pending.size() == kRunBatch) {
+                        flush_batch(rl);
                     }
                 }
+                if (!use_persistent_bo) {
+                    flush_batch(rl);
+                }
             }
+            flush_batch(rl);
         }
     }
     for (int64_t m = 0; m < M; ++m) {

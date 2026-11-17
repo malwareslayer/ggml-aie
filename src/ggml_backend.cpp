@@ -6,6 +6,7 @@
 #include "xrt_ops.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -286,128 +287,198 @@ void ggml_backend_aie2_buffer_memset_tensor(
     std::memset(static_cast<char*>(tensor->data) + offset, value, size);
 }
 
+bool is_prepackable_weight(const struct ggml_tensor* tensor) {
+    if (!tensor || !tensor->data) {
+        return false;
+    }
+    const int64_t K = tensor->ne[0];
+    const int64_t N = tensor->ne[1];
+    return K > 1 && N > 1 && N <= 16384 && tensor->ne[2] == 1 && tensor->ne[3] == 1 &&
+           (static_cast<uint32_t>(tensor->flags) & static_cast<uint32_t>(GGML_TENSOR_FLAG_INPUT)) ==
+               0U &&
+           can_read_as_f32(tensor) && std::strcmp(tensor->name, "token_embd.weight") != 0;
+}
+
+bool build_packed_bf16_weight(const struct ggml_tensor* tensor, PackedWeight& pw,
+                              size_t& out_packed_bytes) {
+    auto& mgr = XrtContextManager::instance();
+    const int64_t K = tensor->ne[0];
+    const int64_t N = tensor->ne[1];
+    const auto t0 = std::chrono::steady_clock::now();
+    constexpr int64_t TK = XrtOpsRunner::kBf16TK;
+    constexpr int64_t KChunks = XrtOpsRunner::kBf16KChunks;
+    constexpr int64_t KSlice = XrtOpsRunner::kBf16KSlice;
+    constexpr int64_t TNW = XrtOpsRunner::kBf16TNW;
+    constexpr int64_t NW = XrtOpsRunner::kBf16NW;
+    constexpr int64_t TN = XrtOpsRunner::kBf16TN;
+    constexpr auto kTileElems = static_cast<size_t>(TNW * TK);
+    constexpr auto kColChunkElems = static_cast<size_t>(4) * kTileElems;
+    constexpr auto kColSliceElems = static_cast<size_t>(KChunks) * kColChunkElems;
+    constexpr auto kSliceElems = static_cast<size_t>(NW * KChunks) * kTileElems;
+
+    const int64_t n_slices = (N + TN - 1) / TN;
+    const int64_t k_slices = (K + KSlice - 1) / KSlice;
+    const size_t packed_elems = static_cast<size_t>(n_slices * k_slices) * kSliceElems;
+    const size_t packed_bytes = packed_elems * sizeof(uint16_t);
+    const size_t prev = g_total_prepack_bytes.load(std::memory_order_relaxed);
+    if (prev + packed_bytes > kMaxPrepackBytes) {
+        return false;
+    }
+
+    pw.data_bf16.assign(packed_elems, uint16_t{0});
+    pw.is_bf16 = true;
+    pw.n_blocks = n_slices;
+    pw.k_blocks = k_slices;
+    pw.N = N;
+    pw.K = K;
+
+    const auto to_bf16 = [](float f) -> uint16_t {
+        uint32_t u = 0;
+        std::memcpy(&u, &f, sizeof(u));
+        u += 0x7FFFu + ((u >> 16U) & 1U);
+        return static_cast<uint16_t>(u >> 16U);
+    };
+
+    std::vector<float> row_buf(static_cast<size_t>(K));
+    for (int64_t n = 0; n < N; ++n) {
+        read_row_f32(tensor, n, 0, 0, row_buf.data());
+        const int64_t ns = n / TN;
+        const int64_t n_rem = n % TN;
+        const int64_t w = n_rem / TNW;
+        const int64_t col = w / 4;
+        const int64_t row = w % 4;
+        const int64_t n_local = n_rem % TNW;
+        const int64_t n8 = n_local / 8;
+        const int64_t n_in = n_local % 8;
+        for (int64_t k = 0; k < K; ++k) {
+            const int64_t ks = k / KSlice;
+            const int64_t k_rem = k % KSlice;
+            const int64_t kc = k_rem / TK;
+            const int64_t k_local = k_rem % TK;
+            const int64_t k8 = k_local / 8;
+            const int64_t k_in = k_local % 8;
+            const size_t idx = (static_cast<size_t>((ns * k_slices) + ks) * kSliceElems) +
+                               (static_cast<size_t>(col) * kColSliceElems) +
+                               (static_cast<size_t>(kc) * kColChunkElems) +
+                               (static_cast<size_t>(row) * kTileElems) +
+                               static_cast<size_t>((((n8 * 8) + k8) * 64) + (k_in * 8) + n_in);
+            pw.data_bf16[idx] = to_bf16(row_buf[static_cast<size_t>(k)]);
+        }
+    }
+    const auto t1 = std::chrono::steady_clock::now();
+    mgr.add_prepack_ns(std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count());
+
+    const size_t cur_bo = g_total_bo_weight_bytes.load(std::memory_order_relaxed);
+    if (cur_bo + packed_bytes <= kMaxBoWeightBytes) {
+        try {
+            const std::scoped_lock xrt_lock(mgr.mutex());
+            const auto& prog = mgr.slot(Aie2OpKind::kGemmBf16);
+            const auto n_slices_total = static_cast<size_t>(n_slices * k_slices);
+            const size_t slice_bytes = kSliceElems * sizeof(uint16_t);
+            const int grp = prog.kernel.group_id(4);
+            pw.slice_bos.reserve(n_slices_total);
+            for (size_t s = 0; s < n_slices_total; ++s) {
+                xrt::bo bo(mgr.device(), slice_bytes, xrt::bo::flags::host_only, grp);
+                std::memcpy(bo.map<void*>(), pw.data_bf16.data() + (s * kSliceElems), slice_bytes);
+                bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+                pw.slice_bos.push_back(std::move(bo));
+            }
+            pw.bo_bytes = packed_bytes;
+            pw.data_bf16.clear();
+            pw.data_bf16.shrink_to_fit();
+        } catch (const std::exception&) {
+            pw.slice_bos.clear();
+            pw.bo_bytes = 0;
+        }
+    }
+    out_packed_bytes = packed_bytes;
+    return true;
+}
+
+struct HostWeightEntry {
+    enum ggml_type type = GGML_TYPE_COUNT;
+    int64_t N = 0;
+    int64_t K = 0;
+    std::array<uint8_t, 16> head{};
+    size_t packed_bytes = 0;
+    std::shared_ptr<const PackedWeight> pw;
+};
+
+std::shared_ptr<const PackedWeight> get_or_prepack_host_weight(const struct ggml_tensor* tensor) {
+    if (!is_prepackable_weight(tensor)) {
+        return nullptr;
+    }
+    std::array<uint8_t, 16> cur_head{};
+    const size_t nbytes = ggml_nbytes(tensor);
+    std::memcpy(cur_head.data(), tensor->data, std::min(cur_head.size(), nbytes));
+
+    static std::mutex cache_mu;
+    static std::unordered_map<const void*, HostWeightEntry> cache;
+    {
+        const std::scoped_lock lock(cache_mu);
+        const auto it = cache.find(tensor->data);
+        if (it != cache.end() && it->second.type == tensor->type && it->second.N == tensor->ne[1] &&
+            it->second.K == tensor->ne[0] && it->second.head == cur_head) {
+            return it->second.pw;
+        }
+    }
+
+    auto pw = std::make_shared<PackedWeight>();
+    size_t packed_bytes = 0;
+    if (!build_packed_bf16_weight(tensor, *pw, packed_bytes)) {
+        return nullptr;
+    }
+
+    const std::scoped_lock lock(cache_mu);
+    auto& entry = cache[tensor->data];
+    if (entry.pw) {
+        if (entry.pw->bo_bytes > 0) {
+            g_total_bo_weight_bytes.fetch_sub(entry.pw->bo_bytes, std::memory_order_relaxed);
+        } else {
+            g_total_prepack_bytes.fetch_sub(entry.packed_bytes, std::memory_order_relaxed);
+        }
+    }
+    if (pw->bo_bytes > 0) {
+        g_total_bo_weight_bytes.fetch_add(pw->bo_bytes, std::memory_order_relaxed);
+    } else {
+        g_total_prepack_bytes.fetch_add(packed_bytes, std::memory_order_relaxed);
+    }
+    entry.type = tensor->type;
+    entry.N = tensor->ne[1];
+    entry.K = tensor->ne[0];
+    entry.head = cur_head;
+    entry.packed_bytes = packed_bytes;
+    entry.pw = pw;
+    return pw;
+}
+
 void ggml_backend_aie2_buffer_set_tensor(ggml_backend_buffer_t buffer, struct ggml_tensor* tensor,
                                          const void* data, size_t offset, size_t size) {
     auto* ctx = static_cast<ggml_backend_aie2_buffer*>(ollama_buf(buffer)->context);
     std::memcpy(static_cast<char*>(tensor->data) + offset, data, size);
 
     const size_t total_bytes = ggml_nbytes(tensor);
-    if (offset != 0 || size != total_bytes) {
+    if (offset != 0 || size != total_bytes || !is_prepackable_weight(tensor)) {
         return;
     }
 
-    auto& mgr = XrtContextManager::instance();
-    const int64_t K = tensor->ne[0];
-    const int64_t N = tensor->ne[1];
-    const bool is_2d_weight =
-        (K > 1 && N > 1 && N <= 16384 && tensor->ne[2] == 1 && tensor->ne[3] == 1 &&
-         (static_cast<uint32_t>(tensor->flags) & static_cast<uint32_t>(GGML_TENSOR_FLAG_INPUT)) ==
-             0U &&
-         can_read_as_f32(tensor) && std::strcmp(tensor->name, "token_embd.weight") != 0);
-
-    if (is_2d_weight) {
-        const auto t0 = std::chrono::steady_clock::now();
-        constexpr int64_t TK = XrtOpsRunner::kBf16TK;
-        constexpr int64_t KChunks = XrtOpsRunner::kBf16KChunks;
-        constexpr int64_t KSlice = XrtOpsRunner::kBf16KSlice;
-        constexpr int64_t TNW = XrtOpsRunner::kBf16TNW;
-        constexpr int64_t NW = XrtOpsRunner::kBf16NW;
-        constexpr int64_t TN = XrtOpsRunner::kBf16TN;
-        constexpr auto kTileElems = static_cast<size_t>(TNW * TK);
-        constexpr auto kColChunkElems = static_cast<size_t>(4) * kTileElems;
-        constexpr auto kColSliceElems = static_cast<size_t>(KChunks) * kColChunkElems;
-        constexpr auto kSliceElems = static_cast<size_t>(NW * KChunks) * kTileElems;
-
-        const int64_t n_slices = (N + TN - 1) / TN;
-        const int64_t k_slices = (K + KSlice - 1) / KSlice;
-        const size_t packed_elems = static_cast<size_t>(n_slices * k_slices) * kSliceElems;
-        const size_t packed_bytes = packed_elems * sizeof(uint16_t);
-        const size_t prev = g_total_prepack_bytes.load(std::memory_order_relaxed);
-        if (prev + packed_bytes > kMaxPrepackBytes) {
-            return;
-        }
-
-        PackedWeight pw;
-        pw.data_bf16.assign(packed_elems, uint16_t{0});
-        pw.is_bf16 = true;
-        pw.n_blocks = n_slices;
-        pw.k_blocks = k_slices;
-        pw.N = N;
-        pw.K = K;
-
-        const auto to_bf16 = [](float f) -> uint16_t {
-            uint32_t u = 0;
-            std::memcpy(&u, &f, sizeof(u));
-            u += 0x7FFFu + ((u >> 16U) & 1U);
-            return static_cast<uint16_t>(u >> 16U);
-        };
-
-        std::vector<float> row_buf(static_cast<size_t>(K));
-        for (int64_t n = 0; n < N; ++n) {
-            read_row_f32(tensor, n, 0, 0, row_buf.data());
-            const int64_t ns = n / TN;
-            const int64_t n_rem = n % TN;
-            const int64_t w = n_rem / TNW;
-            const int64_t col = w / 4;
-            const int64_t row = w % 4;
-            const int64_t n_local = n_rem % TNW;
-            const int64_t n8 = n_local / 8;
-            const int64_t n_in = n_local % 8;
-            for (int64_t k = 0; k < K; ++k) {
-                const int64_t ks = k / KSlice;
-                const int64_t k_rem = k % KSlice;
-                const int64_t kc = k_rem / TK;
-                const int64_t k_local = k_rem % TK;
-                const int64_t k8 = k_local / 8;
-                const int64_t k_in = k_local % 8;
-                const size_t idx = (static_cast<size_t>((ns * k_slices) + ks) * kSliceElems) +
-                                   (static_cast<size_t>(col) * kColSliceElems) +
-                                   (static_cast<size_t>(kc) * kColChunkElems) +
-                                   (static_cast<size_t>(row) * kTileElems) +
-                                   static_cast<size_t>((((n8 * 8) + k8) * 64) + (k_in * 8) + n_in);
-                pw.data_bf16[idx] = to_bf16(row_buf[static_cast<size_t>(k)]);
-            }
-        }
-        const auto t1 = std::chrono::steady_clock::now();
-        mgr.add_prepack_ns(std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count());
-
-        const size_t cur_bo = g_total_bo_weight_bytes.load(std::memory_order_relaxed);
-        if (cur_bo + packed_bytes <= kMaxBoWeightBytes) {
-            try {
-                const std::scoped_lock xrt_lock(mgr.mutex());
-                const auto& prog = mgr.slot(Aie2OpKind::kGemmBf16);
-                const auto n_slices_total = static_cast<size_t>(n_slices * k_slices);
-                const size_t slice_bytes = kSliceElems * sizeof(uint16_t);
-                const int grp = prog.kernel.group_id(4);
-                pw.slice_bos.reserve(n_slices_total);
-                for (size_t s = 0; s < n_slices_total; ++s) {
-                    xrt::bo bo(mgr.device(), slice_bytes, xrt::bo::flags::host_only, grp);
-                    std::memcpy(bo.map<void*>(), pw.data_bf16.data() + (s * kSliceElems),
-                                slice_bytes);
-                    bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-                    pw.slice_bos.push_back(std::move(bo));
-                }
-                pw.bo_bytes = packed_bytes;
-                pw.data_bf16.clear();
-                pw.data_bf16.shrink_to_fit();
-            } catch (const std::exception&) {
-                pw.slice_bos.clear();
-                pw.bo_bytes = 0;
-            }
-        }
-
-        const std::scoped_lock lock(ctx->pack_mu);
-        if (!ctx->packed_weights.contains(tensor->data)) {
-            if (pw.bo_bytes > 0) {
-                ctx->bo_weight_bytes += pw.bo_bytes;
-                g_total_bo_weight_bytes.fetch_add(pw.bo_bytes, std::memory_order_relaxed);
-            } else {
-                ctx->prepacked_bytes += packed_bytes;
-                g_total_prepack_bytes.fetch_add(packed_bytes, std::memory_order_relaxed);
-            }
-        }
-        ctx->packed_weights[tensor->data] = std::move(pw);
+    PackedWeight pw;
+    size_t packed_bytes = 0;
+    if (!build_packed_bf16_weight(tensor, pw, packed_bytes)) {
+        return;
     }
+
+    const std::scoped_lock lock(ctx->pack_mu);
+    if (!ctx->packed_weights.contains(tensor->data)) {
+        if (pw.bo_bytes > 0) {
+            ctx->bo_weight_bytes += pw.bo_bytes;
+            g_total_bo_weight_bytes.fetch_add(pw.bo_bytes, std::memory_order_relaxed);
+        } else {
+            ctx->prepacked_bytes += packed_bytes;
+            g_total_prepack_bytes.fetch_add(packed_bytes, std::memory_order_relaxed);
+        }
+    }
+    ctx->packed_weights[tensor->data] = std::move(pw);
 }
 
 void ggml_backend_aie2_buffer_get_tensor(ggml_backend_buffer_t /*buffer*/,
@@ -904,12 +975,17 @@ ggml_status compute_node(ggml_tensor* node) {
 
         ggml_backend_aie2_buffer* w_buf = get_aie2_buffer(src0);
         const PackedWeight* pw = nullptr;
+        std::shared_ptr<const PackedWeight> host_pw;
         if (w_buf && src0->ne[2] == 1 && src0->ne[3] == 1) {
             const std::scoped_lock lock(w_buf->pack_mu);
             const auto it = w_buf->packed_weights.find(src0->data);
             if (it != w_buf->packed_weights.end() && it->second.N == N && it->second.K == K) {
                 pw = &it->second;
             }
+        }
+        if (!pw) {
+            host_pw = get_or_prepack_host_weight(src0);
+            pw = host_pw.get();
         }
 
         std::vector<float> a_slice;
