@@ -30,41 +30,86 @@ XrtContextManager& XrtContextManager::instance() {
 
 XrtContextManager::XrtContextManager() : device_(0) {}
 
-XrtContextManager::ProgramHandle XrtContextManager::acquire(const std::string& xclbin_path,
-                                                            const std::string& insts_path,
-                                                            const std::string& kernel_name) {
-    const std::string key = xclbin_path + "|" + kernel_name;
+void XrtContextManager::initialize(const std::string& ops_dir) {
+    const std::scoped_lock lock(mu_);
+    if (initialized_ && initialized_dir_ == ops_dir) {
+        return;
+    }
+    initialized_ = true;
+    initialized_dir_ = ops_dir;
+}
 
-    for (auto it = lru_list_.begin(); it != lru_list_.end(); ++it) {
-        if (it->key == key) {
-            lru_list_.splice(lru_list_.begin(), lru_list_, it);
-            return ProgramHandle{&device_, &it->hw_ctx, &it->kernel, it->insts};
+XrtContextManager::ProgramSlot& XrtContextManager::slot(Aie2OpKind kind) {
+    ProgramSlot& prog = slots_[static_cast<size_t>(kind)];
+    if (prog.initialized) {
+        return prog;
+    }
+    if (!initialized_) {
+        throw std::runtime_error("XrtContextManager::slot called before initialize()");
+    }
+
+    struct Spec {
+        Aie2OpKind kind;
+        const char* name;
+        std::array<size_t, 3> arg_bytes;
+    };
+
+    constexpr size_t kGemmTileBytes = static_cast<size_t>(64) * 64U * sizeof(float);
+    constexpr size_t kVecBytes = static_cast<size_t>(4096) * sizeof(float);
+    constexpr size_t kAuxLargeBytes = static_cast<size_t>(4112) * sizeof(float);
+    constexpr size_t kAuxSmallBytes = static_cast<size_t>(16) * sizeof(float);
+
+    constexpr std::array<Spec, static_cast<size_t>(Aie2OpKind::kCount)> kSpecs = {{
+        {Aie2OpKind::kGemmF32,
+         "gemm_f32",
+         {kGemmTileBytes, 4U * kGemmTileBytes, 4U * kGemmTileBytes}},
+        {Aie2OpKind::kLayerNorm, "layernorm", {kVecBytes, kVecBytes, kAuxSmallBytes}},
+        {Aie2OpKind::kSoftmax, "softmax", {kVecBytes, kAuxLargeBytes, kVecBytes}},
+        {Aie2OpKind::kEltwise, "eltwise", {kVecBytes, kAuxLargeBytes, kVecBytes}},
+        {Aie2OpKind::kUnary, "unary", {kVecBytes, kVecBytes, kAuxSmallBytes}},
+        {Aie2OpKind::kL2Norm, "l2_norm", {kVecBytes, kVecBytes, kAuxSmallBytes}},
+    }};
+
+    const auto& spec = kSpecs[static_cast<size_t>(kind)];
+    const fs::path base = fs::path(initialized_dir_) / spec.name;
+    const std::string xclbin_path = (base / (std::string(spec.name) + ".xclbin")).string();
+    const std::string insts_path = (base / "insts.bin").string();
+    if (!fs::exists(xclbin_path)) {
+        throw std::runtime_error("Missing xclbin: " + xclbin_path);
+    }
+    const auto insts = load_xrt_insts_bin(insts_path);
+    const xrt::xclbin xb(xclbin_path);
+    prog.uuid = device_.register_xclbin(xb);
+    prog.hw_ctx = xrt::hw_context(device_, prog.uuid);
+    prog.kernel = xrt::kernel(prog.hw_ctx, "MLIR_AIE");
+    prog.insts_count = static_cast<uint32_t>(insts.size());
+    prog.insts_bo = xrt::bo(device_, insts.size() * sizeof(uint32_t), XCL_BO_FLAGS_CACHEABLE,
+                            prog.kernel.group_id(1));
+    prog.insts_bo.write(insts.data());
+    timed_sync(prog.insts_bo, XCL_BO_SYNC_BO_TO_DEVICE);
+
+    for (size_t i = 0; i < 3; ++i) {
+        const size_t sz = spec.arg_bytes[i];
+        if (sz > 0) {
+            prog.args[i].bo = xrt::bo(device_, sz, xrt::bo::flags::host_only,
+                                      prog.kernel.group_id(static_cast<int>(i + 3)));
+            prog.args[i].mapped = prog.args[i].bo.map<void*>();
+            prog.args[i].bytes = sz;
         }
     }
 
-    auto uuid_it = registered_xclbins_.find(xclbin_path);
-    if (uuid_it == registered_xclbins_.end()) {
-        if (!fs::exists(xclbin_path)) {
-            throw std::runtime_error("Missing xclbin: " + xclbin_path);
-        }
-        const xrt::xclbin xb(xclbin_path);
-        xrt::uuid uuid = device_.register_xclbin(xb);
-        uuid_it = registered_xclbins_.emplace(xclbin_path, uuid).first;
-    }
+    prog.run = xrt::run(prog.kernel);
+    prog.run.set_arg(0, 3U);
+    prog.run.set_arg(1, prog.insts_bo);
+    prog.run.set_arg(2, prog.insts_count);
+    prog.initialized = true;
+    return prog;
+}
 
-    auto insts_it = cached_insts_.find(insts_path);
-    if (insts_it == cached_insts_.end()) {
-        insts_it = cached_insts_.emplace(insts_path, load_xrt_insts_bin(insts_path)).first;
-    }
-
-    while (lru_list_.size() >= kMaxActiveContexts) {
-        lru_list_.pop_back();
-    }
-
-    xrt::hw_context hw_ctx(device_, uuid_it->second);
-    xrt::kernel kernel(hw_ctx, kernel_name);
-    lru_list_.push_front(CachedProgram{key, uuid_it->second, std::move(hw_ctx), std::move(kernel),
-                                       insts_it->second});
-    auto& entry = lru_list_.front();
-    return ProgramHandle{&device_, &entry.hw_ctx, &entry.kernel, entry.insts};
+void XrtContextManager::timed_sync(xrt::bo& bo, xclBOSyncDirection dir) {
+    const auto t0 = std::chrono::steady_clock::now();
+    bo.sync(dir);
+    const auto t1 = std::chrono::steady_clock::now();
+    sync_ns_.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count(),
+                       std::memory_order_relaxed);
 }

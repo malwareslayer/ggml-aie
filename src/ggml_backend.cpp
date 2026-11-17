@@ -1,9 +1,13 @@
-// GGML backend for AMD AIE2 (Phoenix/XDNA1) via XRT. Only standard GGML
-// backend/device/registry interfaces are implemented; unsupported ops are rejected.
+// GGML backend for AMD AIE2 (Phoenix/XDNA1) via XRT. Implements zero-copy
+// mmap buffers (xrt::bo::map), one-time weight pre-packing in set_tensor,
+// persistent XRT contexts/scratch BOs, and phase-level 3-way hybrid routing.
 #include "ggml-backend-impl.h"
+#include "xrt_context.h"
 #include "xrt_ops.h"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -11,15 +15,75 @@
 #include <cstdlib>
 #include <cstring>
 #include <exception>
-#include <filesystem>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <unistd.h>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
 namespace {
+
+struct OllamaBufferTypeI {
+    const char* (*get_name)(ggml_backend_buffer_type_t buft);
+    ggml_backend_buffer_t (*alloc_buffer)(ggml_backend_buffer_type_t buft, size_t size);
+    ggml_backend_buffer_t (*alloc_buffer_n)(ggml_backend_buffer_type_t buft,
+                                            const struct ggml_tensor* const* tensors,
+                                            size_t n_tensors);
+    size_t (*get_alignment)(ggml_backend_buffer_type_t buft);
+    size_t (*get_max_size)(ggml_backend_buffer_type_t buft);
+    size_t (*get_alloc_size)(ggml_backend_buffer_type_t buft, const struct ggml_tensor* tensor);
+    size_t (*get_alloc_size_n)(ggml_backend_buffer_type_t buft,
+                               const struct ggml_tensor* const* tensors, size_t n_tensors);
+    bool (*is_host)(ggml_backend_buffer_type_t buft);
+};
+
+struct OllamaBufferType {
+    OllamaBufferTypeI iface;
+    ggml_backend_dev_t device;
+    void* context;
+};
+
+struct OllamaBufferI {
+    void (*free_buffer)(ggml_backend_buffer_t buffer);
+    void* (*get_base)(ggml_backend_buffer_t buffer);
+    enum ggml_status (*init_tensor)(ggml_backend_buffer_t buffer, struct ggml_tensor* tensor);
+    void (*memset_tensor)(ggml_backend_buffer_t buffer, struct ggml_tensor* tensor, uint8_t value,
+                          size_t offset, size_t size);
+    void (*set_tensor)(ggml_backend_buffer_t buffer, struct ggml_tensor* tensor, const void* data,
+                       size_t offset, size_t size);
+    void (*get_tensor)(ggml_backend_buffer_t buffer, const struct ggml_tensor* tensor, void* data,
+                       size_t offset, size_t size);
+    void (*set_tensor_2d)(ggml_backend_buffer_t buffer, struct ggml_tensor* tensor,
+                          const void* data, size_t offset, size_t size, size_t n_copies,
+                          size_t stride_tensor, size_t stride_data);
+    void (*get_tensor_2d)(ggml_backend_buffer_t buffer, const struct ggml_tensor* tensor,
+                          void* data, size_t offset, size_t size, size_t n_copies,
+                          size_t stride_tensor, size_t stride_data);
+    bool (*cpy_tensor)(ggml_backend_buffer_t buffer, const struct ggml_tensor* src,
+                       struct ggml_tensor* dst);
+    void (*clear)(ggml_backend_buffer_t buffer, uint8_t value);
+    void (*reset)(ggml_backend_buffer_t buffer);
+    void* reserved_n0;
+    void* reserved_n1;
+    void* reserved_n2;
+};
+
+struct OllamaBuffer {
+    OllamaBufferI iface;
+    ggml_backend_buffer_type_t buft;
+    void* context;
+    size_t size;
+    enum ggml_backend_buffer_usage usage;
+};
+
+static_assert(sizeof(OllamaBufferType) == 0x50);
+static_assert(offsetof(OllamaBufferType, device) == 0x40);
+static_assert(sizeof(OllamaBufferI) == 0x70);
+static_assert(sizeof(OllamaBuffer) == 0x90);
+static_assert(offsetof(OllamaBuffer, buft) == 0x70);
+static_assert(offsetof(OllamaBuffer, context) == 0x78);
 
 struct State {
     std::mutex init_lock;
@@ -28,6 +92,17 @@ struct State {
 };
 State state;
 extern ggml_backend_device device;
+extern OllamaBufferType aie2_buffer_type_storage;
+
+ggml_backend_buffer_type_t aie2_buft_ptr() {
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
+    return reinterpret_cast<ggml_backend_buffer_type_t>(&aie2_buffer_type_storage);
+}
+
+OllamaBuffer* ollama_buf(ggml_backend_buffer_t buffer) {
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
+    return reinterpret_cast<OllamaBuffer*>(buffer);
+}
 
 std::shared_ptr<XrtOpsRunner> get_ops() {
     const char* env = std::getenv("AIE2_XRT_OPS_DIR");
@@ -136,99 +211,325 @@ int32_t unary_op_code(enum ggml_unary_op uop) {
 constexpr int kOpUnary = 92;
 constexpr int kOpGlu = 101;
 
-bool op_supported(const ggml_tensor* op) {
+struct PackedWeight {
+    std::vector<float> data;
+    int64_t n_blocks = 0;
+    int64_t k_blocks = 0;
+    int64_t N = 0;
+    int64_t K = 0;
+};
+
+struct ggml_backend_aie2_buffer {
+    void* base = nullptr;
+    size_t size = 0;
+    size_t prepacked_bytes = 0;
+    std::mutex pack_mu;
+    std::unordered_map<const void*, PackedWeight> packed_weights;
+};
+
+std::atomic<size_t> g_total_prepack_bytes{0};
+constexpr size_t kMaxPrepackBytes = 1024ULL * 1024ULL * 1024ULL; // 1 GiB cap for F32 pre-pack cache
+
+ggml_backend_aie2_buffer* get_aie2_buffer(const struct ggml_tensor* t) {
+    if (!t) {
+        return nullptr;
+    }
+    const struct ggml_tensor* root = t->view_src ? t->view_src : t;
+    ggml_backend_buffer_t b = root->buffer;
+    if (!b || ollama_buf(b)->buft != aie2_buft_ptr()) {
+        return nullptr;
+    }
+    return static_cast<ggml_backend_aie2_buffer*>(ollama_buf(b)->context);
+}
+
+void ggml_backend_aie2_buffer_free(ggml_backend_buffer_t buffer) {
+    const auto* ctx = static_cast<ggml_backend_aie2_buffer*>(ollama_buf(buffer)->context);
+    if (ctx) {
+        if (ctx->prepacked_bytes > 0) {
+            g_total_prepack_bytes.fetch_sub(ctx->prepacked_bytes, std::memory_order_relaxed);
+        }
+        std::free(ctx->base);
+        delete ctx;
+    }
+}
+
+void* ggml_backend_aie2_buffer_get_base(ggml_backend_buffer_t buffer) {
+    const auto* ctx = static_cast<ggml_backend_aie2_buffer*>(ollama_buf(buffer)->context);
+    return ctx->base;
+}
+
+void ggml_backend_aie2_buffer_memset_tensor(
+    ggml_backend_buffer_t /*buffer*/,
+    struct ggml_tensor* tensor, // NOLINT(misc-const-correctness)
+    uint8_t value, size_t offset, size_t size) {
+    std::memset(static_cast<char*>(tensor->data) + offset, value, size);
+}
+
+void ggml_backend_aie2_buffer_set_tensor(ggml_backend_buffer_t buffer, struct ggml_tensor* tensor,
+                                         const void* data, size_t offset, size_t size) {
+    auto* ctx = static_cast<ggml_backend_aie2_buffer*>(ollama_buf(buffer)->context);
+    std::memcpy(static_cast<char*>(tensor->data) + offset, data, size);
+
+    const size_t total_bytes = ggml_nbytes(tensor);
+    if (offset != 0 || size != total_bytes) {
+        return;
+    }
+
+    auto& mgr = XrtContextManager::instance();
+    const int64_t K = tensor->ne[0];
+    const int64_t N = tensor->ne[1];
+    const bool is_2d_weight =
+        (K > 1 && N > 1 && N <= 16384 && tensor->ne[2] == 1 && tensor->ne[3] == 1 &&
+         (static_cast<uint32_t>(tensor->flags) & static_cast<uint32_t>(GGML_TENSOR_FLAG_INPUT)) ==
+             0U &&
+         can_read_as_f32(tensor) && std::strcmp(tensor->name, "token_embd.weight") != 0);
+
+    if (is_2d_weight) {
+        const auto t0 = std::chrono::steady_clock::now();
+        constexpr int64_t TM = XrtOpsRunner::kGemmTM;
+        constexpr int64_t TK = XrtOpsRunner::kGemmTK;
+        constexpr int64_t TN_W = XrtOpsRunner::kGemmTNW;
+        constexpr int64_t NW = XrtOpsRunner::kGemmNW;
+        constexpr int64_t TN = XrtOpsRunner::kGemmTN;
+        constexpr auto kTileElems = static_cast<size_t>(TM * TK);
+        constexpr auto kBlockElems = static_cast<size_t>(NW) * kTileElems;
+
+        const int64_t n_blocks = (N + TN - 1) / TN;
+        const int64_t k_blocks = (K + TK - 1) / TK;
+        const size_t packed_elems = static_cast<size_t>(n_blocks * k_blocks) * kBlockElems;
+        const size_t packed_bytes = packed_elems * sizeof(float);
+        const size_t prev = g_total_prepack_bytes.load(std::memory_order_relaxed);
+        if (prev + packed_bytes > kMaxPrepackBytes) {
+            return;
+        }
+
+        PackedWeight pw;
+        pw.data.assign(packed_elems, 0.0f);
+        pw.n_blocks = n_blocks;
+        pw.k_blocks = k_blocks;
+        pw.N = N;
+        pw.K = K;
+
+        std::vector<float> row_buf(static_cast<size_t>(K));
+        for (int64_t n = 0; n < N; ++n) {
+            read_row_f32(tensor, n, 0, 0, row_buf.data());
+            const int64_t nb_idx = n / TN;
+            const int64_t rem = n % TN;
+            const int64_t w = rem / TN_W;
+            const int64_t nl = rem % TN_W;
+            for (int64_t kb_idx = 0; kb_idx < k_blocks; ++kb_idx) {
+                const int64_t k0 = kb_idx * TK;
+                const int64_t kb = std::min<int64_t>(TK, K - k0);
+                float* dst = pw.data.data() +
+                             (static_cast<size_t>((nb_idx * k_blocks) + kb_idx) * kBlockElems) +
+                             (static_cast<size_t>(w) * kTileElems) + (static_cast<size_t>(nl) * TK);
+                std::memcpy(dst, row_buf.data() + k0, static_cast<size_t>(kb) * sizeof(float));
+            }
+        }
+        const auto t1 = std::chrono::steady_clock::now();
+        mgr.add_prepack_ns(std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count());
+
+        const std::scoped_lock lock(ctx->pack_mu);
+        if (!ctx->packed_weights.contains(tensor->data)) {
+            ctx->prepacked_bytes += packed_bytes;
+            g_total_prepack_bytes.fetch_add(packed_bytes, std::memory_order_relaxed);
+        }
+        ctx->packed_weights[tensor->data] = std::move(pw);
+    }
+}
+
+void ggml_backend_aie2_buffer_get_tensor(ggml_backend_buffer_t /*buffer*/,
+                                         const struct ggml_tensor* tensor, void* data,
+                                         size_t offset, size_t size) {
+    std::memcpy(data, static_cast<const char*>(tensor->data) + offset, size);
+}
+
+void ggml_backend_aie2_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
+    const auto* ctx = static_cast<ggml_backend_aie2_buffer*>(ollama_buf(buffer)->context);
+    std::memset(ctx->base, value, ctx->size);
+}
+
+const OllamaBufferI aie2_buffer_iface = {
+    ggml_backend_aie2_buffer_free,
+    ggml_backend_aie2_buffer_get_base,
+    nullptr,
+    ggml_backend_aie2_buffer_memset_tensor,
+    ggml_backend_aie2_buffer_set_tensor,
+    ggml_backend_aie2_buffer_get_tensor,
+    nullptr,
+    nullptr,
+    nullptr,
+    ggml_backend_aie2_buffer_clear,
+    nullptr,
+    nullptr,
+    nullptr,
+    nullptr,
+};
+
+const char* aie2_buft_get_name(ggml_backend_buffer_type_t /*buft*/) {
+    return "AIE2-XRT-MMAP";
+}
+
+ggml_backend_buffer_t aie2_buft_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
+    if (!get_ops()) {
+        return nullptr;
+    }
+    const size_t alloc_bytes = std::max<size_t>((size + 63U) & ~static_cast<size_t>(63U), 64U);
+    void* base = std::aligned_alloc(64, alloc_bytes);
+    if (!base) {
+        std::fprintf(stderr, "aie2: buffer alloc failed (%zu bytes)\n", size);
+        return nullptr;
+    }
+    auto* ctx = new ggml_backend_aie2_buffer{base, alloc_bytes, 0, {}, {}};
+    using BufferInitFn =
+        ggml_backend_buffer_t (*)(ggml_backend_buffer_type_t, OllamaBufferI, void*, size_t);
+    const auto init_fn = reinterpret_cast<BufferInitFn>(
+        // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast,bugprone-casting-through-void)
+        reinterpret_cast<void*>(&ggml_backend_buffer_init));
+    return init_fn(buft, aie2_buffer_iface, ctx, size);
+}
+
+size_t aie2_buft_get_alignment(ggml_backend_buffer_type_t /*buft*/) {
+    return 64;
+}
+
+bool aie2_buft_is_host(ggml_backend_buffer_type_t /*buft*/) {
+    return true;
+}
+
+OllamaBufferType aie2_buffer_type_storage = {
+    {
+        aie2_buft_get_name,
+        aie2_buft_alloc_buffer,
+        nullptr,
+        aie2_buft_get_alignment,
+        nullptr,
+        nullptr,
+        nullptr,
+        aie2_buft_is_host,
+    },
+    &device,
+    nullptr,
+};
+
+bool is_npu_dma_op(const ggml_tensor* op) {
     switch (static_cast<int>(op->op)) {
-    case GGML_OP_NONE:
-    case GGML_OP_RESHAPE:
-    case GGML_OP_VIEW:
-    case GGML_OP_TRANSPOSE:
-    case GGML_OP_PERMUTE:
-        return true;
-    case GGML_OP_CONT:
-    case GGML_OP_DUP:
-    case GGML_OP_CPY:
-        return can_read_as_f32(op->src[0]) &&
-               (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16);
-    case GGML_OP_PAD:
-        return op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
-    case GGML_OP_GET_ROWS:
-        return can_read_as_f32(op->src[0]) && op->src[1]->type == GGML_TYPE_I32;
-    case GGML_OP_SET_ROWS:
-        return can_read_as_f32(op->src[0]) &&
-               (op->src[1]->type == GGML_TYPE_I64 || op->src[1]->type == GGML_TYPE_I32) &&
-               op->type == GGML_TYPE_F32;
+    case GGML_OP_MUL_MAT:
     case GGML_OP_NORM:
     case GGML_OP_RMS_NORM:
-        return op->src[0]->type == GGML_TYPE_F32 && op->src[0]->ne[0] > 0 &&
-               op->src[0]->ne[0] <= 4096;
+    case GGML_OP_SOFT_MAX:
     case GGML_OP_ADD:
     case GGML_OP_MUL:
     case GGML_OP_SUB:
-        return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32;
     case GGML_OP_SCALE:
-        return op->src[0]->type == GGML_TYPE_F32;
-    case GGML_OP_MUL_MAT:
-        return can_read_as_f32(op->src[0]) && op->src[1]->type == GGML_TYPE_F32;
+    case GGML_OP_DIV:
+    case GGML_OP_UNARY:
+    case kOpUnary:
+    case kOpGlu:
+    case GGML_OP_SUM_ROWS:
+    case GGML_OP_L2_NORM:
+        return true;
+    default:
+        return false;
+    }
+}
+
+bool full_offload_enabled() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("AIE2_FULL_OFFLOAD");
+        return env && *env && std::strcmp(env, "0") != 0;
+    }();
+    return enabled;
+}
+
+int64_t min_gemm_m() {
+    static const int64_t val = []() -> int64_t {
+        const char* env = std::getenv("AIE2_MIN_GEMM_M");
+        if (env && *env) {
+            const long parsed = std::strtol(env, nullptr, 10);
+            if (parsed >= 2) {
+                return static_cast<int64_t>(parsed);
+            }
+        }
+        return 64;
+    }();
+    return val;
+}
+
+bool ggml_backend_aie2_supports_op(ggml_backend_dev_t /*dev*/, const ggml_tensor* op) {
+    const int64_t M = op->ne[1];
+    switch (static_cast<int>(op->op)) {
+    case GGML_OP_MUL_MAT: {
+        if (M < min_gemm_m()) {
+            return false;
+        }
+        const auto* src0 = op->src[0];
+        const auto* src1 = op->src[1];
+        if (!src0 || !src1 || !can_read_as_f32(src0) || src1->type != GGML_TYPE_F32 ||
+            op->type != GGML_TYPE_F32) {
+            return false;
+        }
+        const int64_t K = src0->ne[0];
+        const int64_t N = src0->ne[1];
+        return (M * K * N) >= (8LL * 1024LL * 1024LL);
+    }
+    case GGML_OP_NORM:
+    case GGML_OP_RMS_NORM:
+        return full_offload_enabled() && M > 1 && op->src[0]->type == GGML_TYPE_F32 &&
+               op->src[0]->ne[0] > 0 && op->src[0]->ne[0] <= 4096;
     case GGML_OP_SOFT_MAX:
-        return op->src[0]->type == GGML_TYPE_F32 && op->src[0]->ne[0] > 0 &&
-               op->src[0]->ne[0] <= 4096 &&
+        return full_offload_enabled() && M > 1 && op->src[0]->type == GGML_TYPE_F32 &&
+               op->src[0]->ne[0] > 0 && op->src[0]->ne[0] <= 4096 &&
                (!op->src[1] || op->src[1]->type == GGML_TYPE_F32 ||
                 op->src[1]->type == GGML_TYPE_F16);
+    case GGML_OP_ADD:
+    case GGML_OP_MUL:
+    case GGML_OP_SUB: {
+        if (!full_offload_enabled() || M <= 1 || op->src[0]->type != GGML_TYPE_F32 ||
+            op->src[1]->type != GGML_TYPE_F32) {
+            return false;
+        }
+        const auto* s0 = op->src[0];
+        const auto* s1 = op->src[1];
+        return ggml_are_same_shape(s0, s1) || ggml_nelements(s1) == 1 ||
+               (s1->ne[0] == s0->ne[0] && s1->ne[1] == 1 && s1->ne[2] == 1 && s1->ne[3] == 1);
+    }
+    case GGML_OP_SCALE:
+        return full_offload_enabled() && M > 1 && op->src[0]->type == GGML_TYPE_F32;
+    case GGML_OP_DIV:
+        return full_offload_enabled() && M > 1 && op->src[0]->type == GGML_TYPE_F32 &&
+               op->src[1]->type == GGML_TYPE_F32 && ggml_nelements(op->src[1]) == 1;
+    case GGML_OP_UNARY:
     case kOpUnary:
-        return op->src[0]->type == GGML_TYPE_F32 && unary_op_code(ggml_get_unary_op(op)) >= 0;
+        return full_offload_enabled() && M > 1 && op->src[0]->type == GGML_TYPE_F32 &&
+               unary_op_code(ggml_get_unary_op(op)) >= 0;
     case kOpGlu: {
+        if (!full_offload_enabled() || M <= 1) {
+            return false;
+        }
         const enum ggml_glu_op glu = ggml_get_glu_op(op);
         return op->src[0]->type == GGML_TYPE_F32 &&
                (!op->src[1] || op->src[1]->type == GGML_TYPE_F32) && op->type == GGML_TYPE_F32 &&
                (glu == GGML_GLU_OP_REGLU || glu == GGML_GLU_OP_GEGLU || glu == GGML_GLU_OP_SWIGLU ||
                 glu == GGML_GLU_OP_GEGLU_ERF || glu == GGML_GLU_OP_GEGLU_QUICK);
     }
-    case GGML_OP_ROPE: {
-        const int32_t mode = reinterpret_cast<const int32_t*>(op->op_params)[2];
-        float ext_factor = 0.0f;
-        std::memcpy(&ext_factor, reinterpret_cast<const int32_t*>(op->op_params) + 7,
-                    sizeof(float));
-        const bool supported_mode = (mode == GGML_ROPE_TYPE_NORMAL || mode == GGML_ROPE_TYPE_NEOX);
-        return op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 && op->src[1] &&
-               op->src[1]->type == GGML_TYPE_I32 &&
-               (!op->src[2] || op->src[2]->type == GGML_TYPE_F32) && supported_mode &&
-               ext_factor == 0.0f;
-    }
     case GGML_OP_SUM_ROWS:
-        return op->src[0]->type == GGML_TYPE_F32 && op->src[0]->ne[0] > 0 &&
-               op->src[0]->ne[0] <= 4096;
-    case GGML_OP_DIV:
-        return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
-               ggml_nelements(op->src[1]) == 1;
     case GGML_OP_L2_NORM:
-        return op->src[0]->type == GGML_TYPE_F32 && op->src[0]->ne[0] > 0 &&
-               op->src[0]->ne[0] <= 4096;
-    case GGML_OP_FLASH_ATTN_EXT: {
-        const auto* q = op->src[0];
-        const auto* k = op->src[1];
-        const auto* v = op->src[2];
-        const auto* mask = op->src[3];
-        if (op->type != GGML_TYPE_F32 || op->src[4] != nullptr || op->src[5] != nullptr) {
-            return false;
-        }
-        if (q->type != GGML_TYPE_F32) {
-            return false;
-        }
-        if ((k->type != GGML_TYPE_F32 && k->type != GGML_TYPE_F16) ||
-            (v->type != GGML_TYPE_F32 && v->type != GGML_TYPE_F16)) {
-            return false;
-        }
-        if (mask && mask->type != GGML_TYPE_F32 && mask->type != GGML_TYPE_F16) {
-            return false;
-        }
-        float logit_softcap = 0.0f;
-        std::memcpy(&logit_softcap, reinterpret_cast<const float*>(op->op_params) + 2,
-                    sizeof(float));
-        if (logit_softcap != 0.0f) {
-            return false;
-        }
-        return k->ne[1] > 0 && k->ne[1] <= 4096;
-    }
+        return full_offload_enabled() && M > 1 && op->src[0]->type == GGML_TYPE_F32 &&
+               op->src[0]->ne[0] > 0 && op->src[0]->ne[0] <= 4096;
+    case GGML_OP_GET_ROWS:
+    case GGML_OP_ROPE:
+    case GGML_OP_FLASH_ATTN_EXT:
+    case GGML_OP_VIEW:
+    case GGML_OP_RESHAPE:
+    case GGML_OP_PERMUTE:
+    case GGML_OP_TRANSPOSE:
+    case GGML_OP_CPY:
+    case GGML_OP_CONT:
+    case GGML_OP_DUP:
+    case GGML_OP_PAD:
+    case GGML_OP_SET_ROWS:
+    case GGML_OP_NONE:
     default:
         return false;
     }
@@ -250,7 +551,7 @@ void backend_free(ggml_backend_t backend) {
     delete backend;
 }
 
-ggml_status compute_node(XrtOpsRunner& ops, ggml_tensor* node) {
+ggml_status compute_node(ggml_tensor* node) {
     switch (static_cast<int>(node->op)) {
     case GGML_OP_NONE:
     case GGML_OP_RESHAPE:
@@ -261,18 +562,18 @@ ggml_status compute_node(XrtOpsRunner& ops, ggml_tensor* node) {
     case GGML_OP_CONT:
     case GGML_OP_DUP:
     case GGML_OP_CPY: {
-        std::vector<float> buf;
-        pack_tensor_f32(node->src[0], buf);
-        if (node->type == GGML_TYPE_F32 && ggml_is_contiguous(node)) {
-            std::memcpy(node->data, buf.data(), buf.size() * sizeof(float));
-        } else {
-            int64_t idx = 0;
-            for (int64_t i3 = 0; i3 < node->ne[3]; ++i3) {
-                for (int64_t i2 = 0; i2 < node->ne[2]; ++i2) {
-                    for (int64_t i1 = 0; i1 < node->ne[1]; ++i1) {
-                        for (int64_t i0 = 0; i0 < node->ne[0]; ++i0) {
-                            write_elem_f32(node, i0, i1, i2, i3, buf[idx++]);
-                        }
+        const auto* src0 = node->src[0];
+        if (src0->type == GGML_TYPE_F32 && ggml_is_contiguous(src0) &&
+            node->type == GGML_TYPE_F32 && ggml_is_contiguous(node)) {
+            std::memcpy(node->data, src0->data,
+                        static_cast<size_t>(ggml_nelements(node)) * sizeof(float));
+            return GGML_STATUS_SUCCESS;
+        }
+        for (int64_t i3 = 0; i3 < node->ne[3]; ++i3) {
+            for (int64_t i2 = 0; i2 < node->ne[2]; ++i2) {
+                for (int64_t i1 = 0; i1 < node->ne[1]; ++i1) {
+                    for (int64_t i0 = 0; i0 < node->ne[0]; ++i0) {
+                        write_elem_f32(node, i0, i1, i2, i3, read_elem_f32(src0, i0, i1, i2, i3));
                     }
                 }
             }
@@ -305,15 +606,46 @@ ggml_status compute_node(XrtOpsRunner& ops, ggml_tensor* node) {
                             val = read_elem_f32(
                                 src0, wrap(i0 - lp0, src0->ne[0]), wrap(i1 - lp1, src0->ne[1]),
                                 wrap(i2 - lp2, src0->ne[2]), wrap(i3 - lp3, src0->ne[3]));
-                        } else if (i0 >= lp0 && i0 < node->ne[0] - rp0 && i1 >= lp1 &&
-                                   i1 < node->ne[1] - rp1 && i2 >= lp2 && i2 < node->ne[2] - rp2 &&
-                                   i3 >= lp3 && i3 < node->ne[3] - rp3) {
-                            val = read_elem_f32(src0, i0 - lp0, i1 - lp1, i2 - lp2, i3 - lp3);
+                        } else {
+                            const bool in0 = (i0 >= lp0 && i0 < node->ne[0] - rp0);
+                            const bool in1 = (i1 >= lp1 && i1 < node->ne[1] - rp1);
+                            const bool in2 = (i2 >= lp2 && i2 < node->ne[2] - rp2);
+                            const bool in3 = (i3 >= lp3 && i3 < node->ne[3] - rp3);
+                            if (in0 && in1 && in2 && in3) {
+                                val = read_elem_f32(src0, i0 - lp0, i1 - lp1, i2 - lp2, i3 - lp3);
+                            }
                         }
-                        char* dst_ptr = static_cast<char*>(node->data) + (i0 * node->nb[0]) +
-                                        (i1 * node->nb[1]) + (i2 * node->nb[2]) +
-                                        (i3 * node->nb[3]);
-                        *reinterpret_cast<float*>(dst_ptr) = val;
+                        write_elem_f32(node, i0, i1, i2, i3, val);
+                    }
+                }
+            }
+        }
+        return GGML_STATUS_SUCCESS;
+    }
+    case GGML_OP_GET_ROWS: {
+        const auto* src0 = node->src[0];
+        const auto* src1 = node->src[1];
+        const int64_t nc = node->ne[0];
+        for (int64_t i3 = 0; i3 < node->ne[3]; ++i3) {
+            for (int64_t i2 = 0; i2 < node->ne[2]; ++i2) {
+                for (int64_t i1 = 0; i1 < node->ne[1]; ++i1) {
+                    const char* idx_ptr = static_cast<const char*>(src1->data) +
+                                          (i1 * src1->nb[0]) + (i2 * src1->nb[1]) +
+                                          (i3 * src1->nb[2]);
+                    const int32_t row = *reinterpret_cast<const int32_t*>(idx_ptr);
+                    if (row < 0 || row >= src0->ne[1]) {
+                        return GGML_STATUS_FAILED;
+                    }
+                    if (node->type == GGML_TYPE_F32 && node->nb[0] == sizeof(float)) {
+                        auto* dst_row = reinterpret_cast<float*>(
+                            static_cast<char*>(node->data) + (i1 * node->nb[1]) +
+                            (i2 * node->nb[2]) + (i3 * node->nb[3]));
+                        read_row_f32(src0, row, i2, i3, dst_row);
+                    } else {
+                        for (int64_t i0 = 0; i0 < nc; ++i0) {
+                            write_elem_f32(node, i0, i1, i2, i3,
+                                           read_elem_f32(src0, i0, row, i2, i3));
+                        }
                     }
                 }
             }
@@ -324,62 +656,20 @@ ggml_status compute_node(XrtOpsRunner& ops, ggml_tensor* node) {
         const auto* src0 = node->src[0];
         const auto* src1 = node->src[1];
         const int64_t nc = src0->ne[0];
-        const int64_t nr = src0->ne[1];
-        for (int64_t i03 = 0; i03 < src0->ne[3]; ++i03) {
-            for (int64_t i02 = 0; i02 < src0->ne[2]; ++i02) {
-                const int64_t i12 = i03 % src1->ne[2];
-                const int64_t i11 = i02 % src1->ne[1];
-                for (int64_t i = 0; i < nr; ++i) {
-                    const char* idx_p = static_cast<const char*>(src1->data) + (i * src1->nb[0]) +
-                                        (i11 * src1->nb[1]) + (i12 * src1->nb[2]);
-                    const int64_t dst_row =
-                        (src1->type == GGML_TYPE_I64)
-                            ? *reinterpret_cast<const int64_t*>(idx_p)
-                            : static_cast<int64_t>(*reinterpret_cast<const int32_t*>(idx_p));
-                    if (dst_row < 0 || dst_row >= node->ne[1]) {
-                        std::fprintf(
-                            stderr,
-                            "aie2: SET_ROWS dst_row=%lld out of range [0, %lld) (node=%s "
-                            "src0=%s[%s] src1=%s[%s] ne=[%lld,%lld,%lld,%lld] nb=[%zu,%zu,%zu,%zu] "
-                            "data=%p)\n",
-                            static_cast<long long>(dst_row), static_cast<long long>(node->ne[1]),
-                            node->name, src0->name, ggml_type_name(src0->type), src1->name,
-                            ggml_type_name(src1->type), static_cast<long long>(src1->ne[0]),
-                            static_cast<long long>(src1->ne[1]),
-                            static_cast<long long>(src1->ne[2]),
-                            static_cast<long long>(src1->ne[3]), src1->nb[0], src1->nb[1],
-                            src1->nb[2], src1->nb[3], src1->data);
+        for (int64_t i3 = 0; i3 < src0->ne[3]; ++i3) {
+            for (int64_t i2 = 0; i2 < src0->ne[2]; ++i2) {
+                for (int64_t i1 = 0; i1 < src0->ne[1]; ++i1) {
+                    const char* idx_ptr = static_cast<const char*>(src1->data) +
+                                          (i1 * src1->nb[0]) + ((i2 % src1->ne[1]) * src1->nb[1]) +
+                                          ((i3 % src1->ne[2]) * src1->nb[2]);
+                    const int64_t row = (src1->type == GGML_TYPE_I64)
+                                            ? *reinterpret_cast<const int64_t*>(idx_ptr)
+                                            : *reinterpret_cast<const int32_t*>(idx_ptr);
+                    if (row < 0 || row >= node->ne[1]) {
                         return GGML_STATUS_FAILED;
                     }
-                    char* dst_p = static_cast<char*>(node->data) + (dst_row * node->nb[1]) +
-                                  (i02 * node->nb[2]) + (i03 * node->nb[3]);
-                    for (int64_t c = 0; c < nc; ++c) {
-                        *reinterpret_cast<float*>(dst_p + (c * node->nb[0])) =
-                            read_elem_f32(src0, c, i, i02, i03);
-                    }
-                }
-            }
-        }
-        return GGML_STATUS_SUCCESS;
-    }
-    case GGML_OP_GET_ROWS: {
-        const auto* src0 = node->src[0];
-        const auto* src1 = node->src[1];
-        auto* dst = static_cast<float*>(node->data);
-        const int64_t n0 = src0->ne[0];
-        for (int64_t i3 = 0; i3 < src1->ne[3]; ++i3) {
-            for (int64_t i2 = 0; i2 < src1->ne[2]; ++i2) {
-                for (int64_t i1 = 0; i1 < src1->ne[1]; ++i1) {
-                    for (int64_t i0 = 0; i0 < src1->ne[0]; ++i0) {
-                        const char* idx_p = static_cast<const char*>(src1->data) +
-                                            (i0 * src1->nb[0]) + (i1 * src1->nb[1]) +
-                                            (i2 * src1->nb[2]) + (i3 * src1->nb[3]);
-                        const int32_t row = *reinterpret_cast<const int32_t*>(idx_p);
-                        float* out_row =
-                            dst + (((((i3 * src1->ne[2]) + i2) * src1->ne[1] * src1->ne[0]) +
-                                    (i1 * src1->ne[0]) + i0) *
-                                   n0);
-                        read_row_f32(src0, row, i2, i3, out_row);
+                    for (int64_t i0 = 0; i0 < nc; ++i0) {
+                        write_elem_f32(node, i0, row, i2, i3, read_elem_f32(src0, i0, i1, i2, i3));
                     }
                 }
             }
@@ -388,76 +678,216 @@ ggml_status compute_node(XrtOpsRunner& ops, ggml_tensor* node) {
     }
     case GGML_OP_NORM:
     case GGML_OP_RMS_NORM: {
+        const auto* src0 = node->src[0];
         float eps = 1e-5f;
         std::memcpy(&eps, node->op_params, sizeof(float));
-        std::vector<float> in_buf;
-        pack_tensor_f32(node->src[0], in_buf);
-        ops.layernorm_f32(in_buf.data(), static_cast<float*>(node->data), ggml_nrows(node->src[0]),
-                          node->src[0]->ne[0], eps, node->op == GGML_OP_RMS_NORM);
+        const int64_t row_len = src0->ne[0];
+        const int64_t n_rows = ggml_nrows(src0);
+        const bool is_rms = (node->op == GGML_OP_RMS_NORM);
+        if (ggml_is_contiguous(src0)) {
+            XrtOpsRunner::layernorm_f32(static_cast<const float*>(src0->data),
+                                        static_cast<float*>(node->data), n_rows, row_len, eps,
+                                        is_rms);
+        } else {
+            std::vector<float> in;
+            pack_tensor_f32(src0, in);
+            XrtOpsRunner::layernorm_f32(in.data(), static_cast<float*>(node->data), n_rows, row_len,
+                                        eps, is_rms);
+        }
         return GGML_STATUS_SUCCESS;
     }
     case GGML_OP_ADD:
     case GGML_OP_MUL:
     case GGML_OP_SUB: {
+        const auto* src0 = node->src[0];
+        const auto* src1 = node->src[1];
+        const int64_t total = ggml_nelements(node);
+        const int64_t b_elems = ggml_nelements(src1);
         int32_t op_code = 0;
         if (node->op == GGML_OP_MUL) {
             op_code = 1;
         } else if (node->op == GGML_OP_SUB) {
             op_code = 2;
         }
+        if (ggml_is_contiguous(src0) && ggml_is_contiguous(src1)) {
+            XrtOpsRunner::eltwise_f32(static_cast<const float*>(src0->data),
+                                      static_cast<const float*>(src1->data),
+                                      static_cast<float*>(node->data), total, b_elems, op_code);
+        } else {
+            std::vector<float> a;
+            std::vector<float> b;
+            pack_tensor_f32(src0, a);
+            pack_tensor_f32(src1, b);
+            XrtOpsRunner::eltwise_f32(a.data(), b.data(), static_cast<float*>(node->data), total,
+                                      b_elems, op_code);
+        }
+        return GGML_STATUS_SUCCESS;
+    }
+    case GGML_OP_SCALE: {
+        const auto* src0 = node->src[0];
+        float scale = 1.0f;
+        float bias = 0.0f;
+        std::memcpy(&scale, reinterpret_cast<const float*>(node->op_params), sizeof(float));
+        std::memcpy(&bias, reinterpret_cast<const float*>(node->op_params) + 1, sizeof(float));
+        const int64_t total = ggml_nelements(node);
+        const auto* in_ptr = static_cast<const float*>(src0->data);
+        std::vector<float> in_tmp;
+        if (!ggml_is_contiguous(src0)) {
+            pack_tensor_f32(src0, in_tmp);
+            in_ptr = in_tmp.data();
+        }
+        auto* out_ptr = static_cast<float*>(node->data);
+        XrtOpsRunner::eltwise_f32(in_ptr, &scale, out_ptr, total, 1, 1);
+        if (bias != 0.0f) {
+            XrtOpsRunner::eltwise_f32(out_ptr, &bias, out_ptr, total, 1, 0);
+        }
+        return GGML_STATUS_SUCCESS;
+    }
+    case GGML_OP_DIV: {
         const auto* src0 = node->src[0];
         const auto* src1 = node->src[1];
-        std::vector<float> a_buf;
-        pack_tensor_f32(src0, a_buf);
+        const float inv = 1.0f / read_elem_f32(src1, 0, 0, 0, 0);
         const int64_t total = ggml_nelements(node);
-        if (ggml_are_same_shape(src0, src1) && ggml_is_contiguous(src1)) {
-            ops.eltwise_f32(a_buf.data(), static_cast<const float*>(src1->data),
-                            static_cast<float*>(node->data), total, total, op_code);
-        } else if (src1->ne[0] == node->ne[0] && ggml_nrows(src1) == 1 &&
-                   ggml_is_contiguous(src1)) {
-            ops.eltwise_f32(a_buf.data(), static_cast<const float*>(src1->data),
-                            static_cast<float*>(node->data), total, node->ne[0], op_code);
+        if (ggml_is_contiguous(src0)) {
+            XrtOpsRunner::eltwise_f32(static_cast<const float*>(src0->data), &inv,
+                                      static_cast<float*>(node->data), total, 1, 1);
         } else {
-            std::vector<float> b_buf(static_cast<size_t>(total));
-            int64_t idx = 0;
-            for (int64_t i3 = 0; i3 < node->ne[3]; ++i3) {
-                for (int64_t i2 = 0; i2 < node->ne[2]; ++i2) {
-                    for (int64_t i1 = 0; i1 < node->ne[1]; ++i1) {
-                        for (int64_t i0 = 0; i0 < node->ne[0]; ++i0) {
-                            b_buf[idx++] = read_elem_f32(src1, i0 % src1->ne[0], i1 % src1->ne[1],
-                                                         i2 % src1->ne[2], i3 % src1->ne[3]);
-                        }
-                    }
-                }
-            }
-            ops.eltwise_f32(a_buf.data(), b_buf.data(), static_cast<float*>(node->data), total,
-                            total, op_code);
+            std::vector<float> a;
+            pack_tensor_f32(src0, a);
+            XrtOpsRunner::eltwise_f32(a.data(), &inv, static_cast<float*>(node->data), total, 1, 1);
         }
+        return GGML_STATUS_SUCCESS;
+    }
+    case GGML_OP_UNARY:
+    case kOpUnary: {
+        const auto* src0 = node->src[0];
+        const enum ggml_unary_op uop = ggml_get_unary_op(node);
+        const int32_t code = unary_op_code(uop);
+        if (code < 0) {
+            return GGML_STATUS_FAILED;
+        }
+        const int64_t n = ggml_nelements(node);
+        const auto* in_ptr = static_cast<const float*>(src0->data);
+        std::vector<float> in_tmp;
+        if (!ggml_is_contiguous(src0)) {
+            pack_tensor_f32(src0, in_tmp);
+            in_ptr = in_tmp.data();
+        }
+        XrtOpsRunner::unary_f32(in_ptr, static_cast<float*>(node->data), n, code);
+        return GGML_STATUS_SUCCESS;
+    }
+    case kOpGlu: {
+        const auto* src0 = node->src[0];
+        const auto* src1 = node->src[1];
+        const enum ggml_glu_op glu = ggml_get_glu_op(node);
+        int32_t act_code = 0;
+        if (glu == GGML_GLU_OP_REGLU) {
+            act_code = 3;
+        } else if (glu == GGML_GLU_OP_GEGLU || glu == GGML_GLU_OP_GEGLU_ERF ||
+                   glu == GGML_GLU_OP_GEGLU_QUICK) {
+            act_code = 7;
+        } else if (glu == GGML_GLU_OP_SWIGLU) {
+            act_code = 0;
+        } else {
+            return GGML_STATUS_FAILED;
+        }
+        int32_t swapped = 0;
+        std::memcpy(&swapped, node->op_params + 1, sizeof(int32_t));
+        const int64_t nc = node->ne[0];
+        const int64_t nrows = ggml_nrows(node);
+        const int64_t total = nc * nrows;
+        std::vector<float> gate(static_cast<size_t>(total));
+        std::vector<float> up(static_cast<size_t>(total));
+        if (src1) {
+            pack_tensor_f32(src0, gate);
+            pack_tensor_f32(src1, up);
+        } else {
+            std::vector<float> full;
+            pack_tensor_f32(src0, full);
+            for (int64_t r = 0; r < nrows; ++r) {
+                const float* row = full.data() + (r * 2 * nc);
+                const float* first = row;
+                const float* second = row + nc;
+                std::memcpy(gate.data() + (r * nc), swapped ? second : first,
+                            static_cast<size_t>(nc) * sizeof(float));
+                std::memcpy(up.data() + (r * nc), swapped ? first : second,
+                            static_cast<size_t>(nc) * sizeof(float));
+            }
+        }
+        auto* out_ptr = static_cast<float*>(node->data);
+        XrtOpsRunner::unary_f32(gate.data(), out_ptr, total, act_code);
+        XrtOpsRunner::eltwise_f32(out_ptr, up.data(), out_ptr, total, total, 1);
         return GGML_STATUS_SUCCESS;
     }
     case GGML_OP_MUL_MAT: {
         const auto* src0 = node->src[0];
         const auto* src1 = node->src[1];
-        auto* dst = static_cast<float*>(node->data);
         const int64_t K = src0->ne[0];
         const int64_t N = src0->ne[1];
-        const int64_t M = src1->ne[1];
-        const int64_t r2 = src1->ne[2] / src0->ne[2];
-        const int64_t r3 = src1->ne[3] / src0->ne[3];
-        std::vector<float> a_slice(static_cast<size_t>(M * K));
-        std::vector<float> b_slice(static_cast<size_t>(N * K));
-        for (int64_t i3 = 0; i3 < src1->ne[3]; ++i3) {
-            for (int64_t i2 = 0; i2 < src1->ne[2]; ++i2) {
-                const int64_t i03 = i3 / r3;
-                const int64_t i02 = i2 / r2;
-                for (int64_t m = 0; m < M; ++m) {
-                    read_row_f32(src1, m, i2, i3, a_slice.data() + (m * K));
+        const int64_t M = node->ne[1];
+        const int64_t ne2 = node->ne[2];
+        const int64_t ne3 = node->ne[3];
+        const int64_t r2 = ne2 / src0->ne[2];
+        const int64_t r3 = ne3 / src0->ne[3];
+
+        const bool a_contig = (src1->type == GGML_TYPE_F32 && src1->nb[0] == sizeof(float) &&
+                               src1->nb[1] == static_cast<size_t>(K) * sizeof(float));
+
+        ggml_backend_aie2_buffer* w_buf = get_aie2_buffer(src0);
+        const PackedWeight* pw = nullptr;
+        if (w_buf && src0->ne[2] == 1 && src0->ne[3] == 1) {
+            const std::scoped_lock lock(w_buf->pack_mu);
+            const auto it = w_buf->packed_weights.find(src0->data);
+            if (it != w_buf->packed_weights.end() && it->second.N == N && it->second.K == K) {
+                pw = &it->second;
+            }
+        }
+
+        std::vector<float> a_slice;
+        if (!a_contig) {
+            a_slice.resize(static_cast<size_t>(M * K));
+        }
+        std::vector<float> b_slice;
+        const bool b_f32_contig = (src0->type == GGML_TYPE_F32 && src0->nb[0] == sizeof(float) &&
+                                   src0->nb[1] == static_cast<size_t>(K) * sizeof(float));
+        if (!pw && !b_f32_contig) {
+            b_slice.resize(static_cast<size_t>(N * K));
+        }
+
+        for (int64_t i3 = 0; i3 < ne3; ++i3) {
+            const int64_t i30 = i3 / r3;
+            for (int64_t i2 = 0; i2 < ne2; ++i2) {
+                const int64_t i20 = i2 / r2;
+                const float* a_ptr = nullptr;
+                if (a_contig) {
+                    a_ptr = reinterpret_cast<const float*>(static_cast<const char*>(src1->data) +
+                                                           (i2 * src1->nb[2]) + (i3 * src1->nb[3]));
+                } else {
+                    for (int64_t m = 0; m < M; ++m) {
+                        read_row_f32(src1, m, i2, i3, a_slice.data() + (m * K));
+                    }
+                    a_ptr = a_slice.data();
                 }
-                for (int64_t n = 0; n < N; ++n) {
-                    read_row_f32(src0, n, i02, i03, b_slice.data() + (n * K));
+
+                auto* c_ptr = reinterpret_cast<float*>(static_cast<char*>(node->data) +
+                                                       (i2 * node->nb[2]) + (i3 * node->nb[3]));
+                if (pw) {
+                    XrtOpsRunner::gemm_f32_nt_prepacked(a_ptr, K, pw->data.data(), pw->n_blocks,
+                                                        pw->k_blocks, c_ptr, N, M, N, K);
+                } else {
+                    const float* b_ptr = nullptr;
+                    if (b_f32_contig) {
+                        b_ptr = reinterpret_cast<const float*>(
+                            static_cast<const char*>(src0->data) + (i20 * src0->nb[2]) +
+                            (i30 * src0->nb[3]));
+                    } else {
+                        for (int64_t n = 0; n < N; ++n) {
+                            read_row_f32(src0, n, i20, i30, b_slice.data() + (n * K));
+                        }
+                        b_ptr = b_slice.data();
+                    }
+                    XrtOpsRunner::gemm_f32_nt(a_ptr, K, b_ptr, K, c_ptr, N, M, N, K);
                 }
-                float* c_ptr = dst + (((i3 * node->ne[2]) + i2) * M * N);
-                ops.gemm_f32_nt(a_slice.data(), K, b_slice.data(), K, c_ptr, N, M, N, K);
             }
         }
         return GGML_STATUS_SUCCESS;
@@ -467,297 +897,128 @@ ggml_status compute_node(XrtOpsRunner& ops, ggml_tensor* node) {
         const auto* src1 = node->src[1];
         float scale = 1.0f;
         std::memcpy(&scale, node->op_params, sizeof(float));
-        std::vector<float> in_buf;
-        pack_tensor_f32(src0, in_buf);
-        std::vector<float> mask_buf;
+        const int64_t row_len = src0->ne[0];
+        const int64_t n_rows = ggml_nrows(src0);
+        const auto* in_ptr = static_cast<const float*>(src0->data);
+        std::vector<float> in_tmp;
+        if (!ggml_is_contiguous(src0)) {
+            pack_tensor_f32(src0, in_tmp);
+            in_ptr = in_tmp.data();
+        }
+        std::vector<float> mask;
         int64_t mask_rows = 0;
         if (src1) {
-            pack_tensor_f32(src1, mask_buf);
+            pack_tensor_f32(src1, mask);
             mask_rows = ggml_nrows(src1);
         }
-        ops.softmax_f32(in_buf.data(), src1 ? mask_buf.data() : nullptr,
-                        static_cast<float*>(node->data), ggml_nrows(src0), src0->ne[0], mask_rows,
-                        scale);
-        return GGML_STATUS_SUCCESS;
-    }
-    case GGML_OP_SCALE: {
-        float scale = 1.0f;
-        std::memcpy(&scale, node->op_params, sizeof(float));
-        std::vector<float> in_buf;
-        pack_tensor_f32(node->src[0], in_buf);
-        ops.eltwise_f32(in_buf.data(), &scale, static_cast<float*>(node->data),
-                        ggml_nelements(node->src[0]), 1, 1);
-        return GGML_STATUS_SUCCESS;
-    }
-    case kOpUnary: {
-        std::vector<float> in_buf;
-        pack_tensor_f32(node->src[0], in_buf);
-        const enum ggml_unary_op uop = ggml_get_unary_op(node);
-        if (uop == GGML_UNARY_OP_GELU) {
-            ops.gelu_f32(in_buf.data(), static_cast<float*>(node->data),
-                         ggml_nelements(node->src[0]));
-        } else {
-            const int32_t op_code = unary_op_code(uop);
-            if (op_code < 0) {
-                return GGML_STATUS_FAILED;
-            }
-            ops.unary_f32(in_buf.data(), static_cast<float*>(node->data),
-                          ggml_nelements(node->src[0]), op_code);
-        }
-        return GGML_STATUS_SUCCESS;
-    }
-    case GGML_OP_SUM_ROWS: {
-        std::vector<float> in_buf;
-        pack_tensor_f32(node->src[0], in_buf);
-        ops.reduce_sum_f32(in_buf.data(), static_cast<float*>(node->data), ggml_nrows(node->src[0]),
-                           node->src[0]->ne[0], 1.0f);
-        return GGML_STATUS_SUCCESS;
-    }
-    case GGML_OP_DIV: {
-        std::vector<float> in_buf;
-        pack_tensor_f32(node->src[0], in_buf);
-        const float inv_div = 1.0f / read_elem_f32(node->src[1], 0, 0, 0, 0);
-        ops.eltwise_f32(in_buf.data(), &inv_div, static_cast<float*>(node->data),
-                        ggml_nelements(node->src[0]), 1, 1);
-        return GGML_STATUS_SUCCESS;
-    }
-    case GGML_OP_L2_NORM: {
-        float eps = 1e-12f;
-        std::memcpy(&eps, node->op_params, sizeof(float));
-        if (eps <= 0.0f)
-            eps = 1e-12f;
-        std::vector<float> in_buf;
-        pack_tensor_f32(node->src[0], in_buf);
-        ops.l2_norm_f32(in_buf.data(), static_cast<float*>(node->data), ggml_nrows(node->src[0]),
-                        node->src[0]->ne[0], eps);
-        return GGML_STATUS_SUCCESS;
-    }
-    case kOpGlu: {
-        const auto* src0 = node->src[0];
-        const auto* src1 = node->src[1];
-        const int64_t nc = node->ne[0];
-        const int64_t nr = ggml_nrows(node);
-        const int64_t total = nc * nr;
-        int32_t swapped = 0;
-        std::memcpy(&swapped, reinterpret_cast<const int32_t*>(node->op_params) + 1,
-                    sizeof(int32_t));
-        std::vector<float> gate(static_cast<size_t>(total));
-        std::vector<float> val(static_cast<size_t>(total));
-        if (src1) {
-            const auto* g_t = swapped ? src1 : src0;
-            const auto* v_t = swapped ? src0 : src1;
-            pack_tensor_f32(g_t, gate);
-            pack_tensor_f32(v_t, val);
-        } else {
-            std::vector<float> packed;
-            pack_tensor_f32(src0, packed);
-            for (int64_t r = 0; r < nr; ++r) {
-                const float* row = packed.data() + (r * 2 * nc);
-                const float* g_ptr = swapped ? (row + nc) : row;
-                const float* v_ptr = swapped ? row : (row + nc);
-                std::memcpy(gate.data() + (r * nc), g_ptr, static_cast<size_t>(nc) * sizeof(float));
-                std::memcpy(val.data() + (r * nc), v_ptr, static_cast<size_t>(nc) * sizeof(float));
-            }
-        }
-        std::vector<float> act(static_cast<size_t>(total));
-        const enum ggml_glu_op glu = ggml_get_glu_op(node);
-        if (glu == GGML_GLU_OP_SWIGLU) {
-            ops.unary_f32(gate.data(), act.data(), total, 0);
-        } else if (glu == GGML_GLU_OP_REGLU) {
-            ops.unary_f32(gate.data(), act.data(), total, 3);
-        } else {
-            ops.gelu_f32(gate.data(), act.data(), total);
-        }
-        ops.eltwise_f32(act.data(), val.data(), static_cast<float*>(node->data), total, total, 1);
+        XrtOpsRunner::softmax_f32(in_ptr, src1 ? mask.data() : nullptr,
+                                  static_cast<float*>(node->data), n_rows, row_len, mask_rows,
+                                  scale);
         return GGML_STATUS_SUCCESS;
     }
     case GGML_OP_ROPE: {
         const auto* src0 = node->src[0];
         const auto* src1 = node->src[1];
         const auto* src2 = node->src[2];
-        const int32_t n_dims = reinterpret_cast<const int32_t*>(node->op_params)[1];
-        const int32_t mode = reinterpret_cast<const int32_t*>(node->op_params)[2];
+        const auto* p = reinterpret_cast<const int32_t*>(node->op_params);
+        const int32_t n_dims = p[1];
+        const int32_t mode = p[2];
         float freq_base = 10000.0f;
         float freq_scale = 1.0f;
         float attn_factor = 1.0f;
-        std::memcpy(&freq_base, reinterpret_cast<const int32_t*>(node->op_params) + 5,
-                    sizeof(float));
-        std::memcpy(&freq_scale, reinterpret_cast<const int32_t*>(node->op_params) + 6,
-                    sizeof(float));
-        std::memcpy(&attn_factor, reinterpret_cast<const int32_t*>(node->op_params) + 8,
-                    sizeof(float));
+        std::memcpy(&freq_base, p + 5, sizeof(float));
+        std::memcpy(&freq_scale, p + 6, sizeof(float));
+        std::memcpy(&attn_factor, p + 8, sizeof(float));
         const bool is_neox =
             (static_cast<uint32_t>(mode) & static_cast<uint32_t>(GGML_ROPE_TYPE_NEOX)) != 0U;
-        const auto* pos = static_cast<const int32_t*>(src1->data);
-        const float* freq_factors = src2 ? static_cast<const float*>(src2->data) : nullptr;
         const int64_t ne0 = node->ne[0];
         const int64_t ne1 = node->ne[1];
         const int64_t ne2 = node->ne[2];
         const int64_t ne3 = node->ne[3];
-        const int64_t half = n_dims / 2;
+        const float theta_scale = std::pow(freq_base, -2.0f / static_cast<float>(n_dims));
         for (int64_t i3 = 0; i3 < ne3; ++i3) {
             for (int64_t i2 = 0; i2 < ne2; ++i2) {
-                const float theta_base = static_cast<float>(pos[i2]) * freq_scale;
+                const auto* pos_ptr = reinterpret_cast<const int32_t*>(
+                    static_cast<const char*>(src1->data) + (i2 * src1->nb[0]));
+                const auto pos = static_cast<float>(*pos_ptr);
                 for (int64_t i1 = 0; i1 < ne1; ++i1) {
-                    const auto* s = reinterpret_cast<const float*>(
-                        static_cast<const char*>(src0->data) + (i3 * src0->nb[3]) +
-                        (i2 * src0->nb[2]) + (i1 * src0->nb[1]));
-                    auto* d = reinterpret_cast<float*>(static_cast<char*>(node->data) +
-                                                       (i3 * node->nb[3]) + (i2 * node->nb[2]) +
-                                                       (i1 * node->nb[1]));
-                    for (int64_t ic = 0; ic < half; ++ic) {
-                        float theta =
-                            theta_base * std::pow(freq_base, -2.0f * static_cast<float>(ic) /
-                                                                 static_cast<float>(n_dims));
-                        if (freq_factors) {
-                            theta /= freq_factors[ic];
-                        }
-                        const float c = std::cos(theta) * attn_factor;
-                        const float sn = std::sin(theta) * attn_factor;
-                        const int64_t idx0 = is_neox ? ic : (2 * ic);
-                        const int64_t idx1 = is_neox ? (ic + half) : ((2 * ic) + 1);
-                        const float x0 = s[idx0];
-                        const float x1 = s[idx1];
-                        d[idx0] = (x0 * c) - (x1 * sn);
-                        d[idx1] = (x0 * sn) + (x1 * c);
+                    float theta_base = pos * freq_scale;
+                    for (int64_t d = 0; d < n_dims / 2; ++d) {
+                        const float ff = src2 ? read_elem_f32(src2, d, 0, 0, 0) : 1.0f;
+                        const float ang = theta_base / ff;
+                        const float cos_t = std::cos(ang) * attn_factor;
+                        const float sin_t = std::sin(ang) * attn_factor;
+                        theta_base *= theta_scale;
+                        const int64_t idx0 = is_neox ? d : (2 * d);
+                        const int64_t idx1 = is_neox ? (d + (n_dims / 2)) : ((2 * d) + 1);
+                        const float x0 = read_elem_f32(src0, idx0, i1, i2, i3);
+                        const float x1 = read_elem_f32(src0, idx1, i1, i2, i3);
+                        write_elem_f32(node, idx0, i1, i2, i3, (x0 * cos_t) - (x1 * sin_t));
+                        write_elem_f32(node, idx1, i1, i2, i3, (x0 * sin_t) + (x1 * cos_t));
                     }
-                    for (int64_t i0 = n_dims; i0 < ne0; ++i0) {
-                        d[i0] = s[i0];
+                    for (int64_t d = n_dims; d < ne0; ++d) {
+                        write_elem_f32(node, d, i1, i2, i3, read_elem_f32(src0, d, i1, i2, i3));
                     }
                 }
             }
         }
         return GGML_STATUS_SUCCESS;
     }
-    case GGML_OP_FLASH_ATTN_EXT: {
-        const auto* q = node->src[0];
-        const auto* k = node->src[1];
-        const auto* v = node->src[2];
-        const auto* mask = node->src[3];
-
-        const int64_t DK = q->ne[0];
-        const int64_t N = q->ne[1];
-        const int64_t n_head = q->ne[2];
-        const int64_t n_stream = q->ne[3];
-        const int64_t n_kv = k->ne[1];
-        const int64_t DV = v->ne[0];
-        const int64_t rk2 = n_head / k->ne[2];
-        const int64_t rk3 = n_stream / k->ne[3];
-        const int64_t rv2 = n_head / v->ne[2];
-        const int64_t rv3 = n_stream / v->ne[3];
-
-        float scale = 1.0f;
-        float max_bias = 0.0f;
-        std::memcpy(&scale, reinterpret_cast<const float*>(node->op_params) + 0, sizeof(float));
-        std::memcpy(&max_bias, reinterpret_cast<const float*>(node->op_params) + 1, sizeof(float));
-
-        const uint32_t n_head_log2 = 1u << static_cast<uint32_t>(std::floor(std::log2(n_head)));
-        const float m0 = std::pow(2.0f, -max_bias / static_cast<float>(n_head_log2));
-        const float m1 = std::pow(2.0f, -(max_bias / 2.0f) / static_cast<float>(n_head_log2));
-
-        std::vector<float> q_buf(static_cast<size_t>(N * DK));
-        std::vector<float> k_buf(static_cast<size_t>(n_kv * DK));
-        std::vector<float> kq_buf(static_cast<size_t>(N * n_kv));
-        std::vector<float> mask_buf(mask ? static_cast<size_t>(N * n_kv) : 0);
-        std::vector<float> probs_buf(static_cast<size_t>(N * n_kv));
-        std::vector<float> v_buf(static_cast<size_t>(DV * n_kv));
-        std::vector<float> out_buf(static_cast<size_t>(N * DV));
-
-        for (int64_t iq3 = 0; iq3 < n_stream; ++iq3) {
-            for (int64_t iq2 = 0; iq2 < n_head; ++iq2) {
-                const int64_t ik2 = iq2 / rk2;
-                const int64_t ik3 = iq3 / rk3;
-                const int64_t iv2 = iq2 / rv2;
-                const int64_t iv3 = iq3 / rv3;
-
-                for (int64_t t = 0; t < N; ++t) {
-                    for (int64_t d = 0; d < DK; ++d) {
-                        q_buf[(t * DK) + d] = read_elem_f32(q, d, t, iq2, iq3);
-                    }
-                }
-                for (int64_t ic = 0; ic < n_kv; ++ic) {
-                    for (int64_t d = 0; d < DK; ++d) {
-                        k_buf[(ic * DK) + d] = read_elem_f32(k, d, ic, ik2, ik3);
-                    }
-                }
-                ops.gemm_f32_nt(q_buf.data(), DK, k_buf.data(), DK, kq_buf.data(), n_kv, N, n_kv,
-                                DK);
-
-                if (mask) {
-                    float slope = 1.0f;
-                    if (max_bias > 0.0f) {
-                        if (std::cmp_less(iq2, n_head_log2)) {
-                            slope = std::pow(m0, static_cast<float>(iq2 + 1));
-                        } else {
-                            slope = std::pow(
-                                m1, static_cast<float>(
-                                        (2 * (iq2 - static_cast<int64_t>(n_head_log2))) + 1));
-                        }
-                    }
-                    const int64_t im2 = iq2 % mask->ne[2];
-                    const int64_t im3 = iq3 % mask->ne[3];
-                    for (int64_t t = 0; t < N; ++t) {
-                        for (int64_t ic = 0; ic < n_kv; ++ic) {
-                            mask_buf[(t * n_kv) + ic] =
-                                slope * read_elem_f32(mask, ic, t, im2, im3);
-                        }
-                    }
-                }
-                ops.softmax_f32(kq_buf.data(), mask ? mask_buf.data() : nullptr, probs_buf.data(),
-                                N, n_kv, mask ? N : 0, scale);
-
-                for (int64_t d = 0; d < DV; ++d) {
-                    for (int64_t ic = 0; ic < n_kv; ++ic) {
-                        v_buf[(d * n_kv) + ic] = read_elem_f32(v, d, ic, iv2, iv3);
-                    }
-                }
-                ops.gemm_f32_nt(probs_buf.data(), n_kv, v_buf.data(), n_kv, out_buf.data(), DV, N,
-                                DV, n_kv);
-
-                for (int64_t t = 0; t < N; ++t) {
-                    char* dst_row = static_cast<char*>(node->data) + (iq2 * node->nb[1]) +
-                                    (t * node->nb[2]) + (iq3 * node->nb[3]);
-                    if (node->nb[0] == sizeof(float)) {
-                        std::memcpy(dst_row, out_buf.data() + (t * DV),
-                                    static_cast<size_t>(DV) * sizeof(float));
-                    } else {
-                        for (int64_t d = 0; d < DV; ++d) {
-                            *reinterpret_cast<float*>(dst_row + (d * node->nb[0])) =
-                                out_buf[(t * DV) + d];
-                        }
-                    }
-                }
-            }
+    case GGML_OP_SUM_ROWS: {
+        const auto* src0 = node->src[0];
+        const int64_t row_len = src0->ne[0];
+        const int64_t n_rows = ggml_nrows(src0);
+        const auto* in_ptr = static_cast<const float*>(src0->data);
+        std::vector<float> in_tmp;
+        if (!ggml_is_contiguous(src0)) {
+            pack_tensor_f32(src0, in_tmp);
+            in_ptr = in_tmp.data();
         }
+        XrtOpsRunner::reduce_sum_f32(in_ptr, static_cast<float*>(node->data), n_rows, row_len,
+                                     1.0f);
+        return GGML_STATUS_SUCCESS;
+    }
+    case GGML_OP_L2_NORM: {
+        const auto* src0 = node->src[0];
+        float eps = 1e-12f;
+        std::memcpy(&eps, node->op_params, sizeof(float));
+        const int64_t len = src0->ne[0];
+        const int64_t n_vecs = ggml_nrows(src0);
+        const auto* in_ptr = static_cast<const float*>(src0->data);
+        std::vector<float> in_tmp;
+        if (!ggml_is_contiguous(src0)) {
+            pack_tensor_f32(src0, in_tmp);
+            in_ptr = in_tmp.data();
+        }
+        XrtOpsRunner::l2_norm_f32(in_ptr, static_cast<float*>(node->data), n_vecs, len, eps);
         return GGML_STATUS_SUCCESS;
     }
     default:
-        std::fprintf(stderr, "aie2: unsupported op %s\n", ggml_op_name(node->op));
         return GGML_STATUS_FAILED;
     }
 }
 
-ggml_status graph_compute(ggml_backend_t backend, ggml_cgraph* graph) {
+ggml_status ggml_backend_aie2_graph_compute(ggml_backend_t backend, ggml_cgraph* cgraph) {
     const auto* ctx = static_cast<const BackendContext*>(backend->context);
     if (!ctx || !ctx->ops) {
-        std::fprintf(stderr, "aie2: graph_compute called with null ctx/ops\n");
         return GGML_STATUS_FAILED;
     }
-    const bool trace = std::getenv("AIE2_TRACE") != nullptr;
-    for (int i = 0; i < ggml_graph_n_nodes(graph); ++i) {
-        auto* node = ggml_graph_node(graph, i);
+    auto& mgr = XrtContextManager::instance();
+    int npu_nodes = 0;
+
+    const int n_nodes = ggml_graph_n_nodes(cgraph);
+    for (int i = 0; i < n_nodes; ++i) {
+        ggml_tensor* const node = ggml_graph_node(cgraph, i);
         if ((static_cast<uint32_t>(node->flags) &
              static_cast<uint32_t>(GGML_TENSOR_FLAG_COMPUTE)) == 0U) {
             continue;
         }
-        if (trace) {
-            std::fprintf(stderr, "aie2: node[%d] op=%s ne=[%lld,%lld,%lld,%lld]\n", i,
-                         ggml_op_name(node->op), static_cast<long long>(node->ne[0]),
-                         static_cast<long long>(node->ne[1]), static_cast<long long>(node->ne[2]),
-                         static_cast<long long>(node->ne[3]));
+        if (is_npu_dma_op(node)) {
+            ++npu_nodes;
         }
+
         try {
-            const ggml_status st = compute_node(*ctx->ops, node);
+            const ggml_status st = compute_node(node);
             if (st != GGML_STATUS_SUCCESS) {
                 std::fprintf(stderr, "aie2: node[%d] op=%s returned status %d\n", i,
                              ggml_op_name(node->op), static_cast<int>(st));
@@ -769,12 +1030,36 @@ ggml_status graph_compute(ggml_backend_t backend, ggml_cgraph* graph) {
             return GGML_STATUS_FAILED;
         }
     }
+
+    if (npu_nodes > 0) {
+        const double prepack_ms = static_cast<double>(mgr.prepack_ns()) / 1e6;
+        const double sync_ms = static_cast<double>(mgr.take_sync_ns()) / 1e6;
+        const double kernel_ms = static_cast<double>(mgr.take_kernel_ns()) / 1e6;
+        std::fprintf(stderr,
+                     "[aie2-timing] set_tensor_prepack=%.3f ms | bo_sync=%.3f ms | "
+                     "npu_kernel=%.3f ms (nodes=%d)\n",
+                     prepack_ms, sync_ms, kernel_ms, npu_nodes);
+    }
     return GGML_STATUS_SUCCESS;
 }
 
 const ggml_backend_i backend_iface = {
-    backend_name, backend_free, nullptr, nullptr, nullptr,       nullptr, nullptr, nullptr,
-    nullptr,      nullptr,      nullptr, nullptr, graph_compute, nullptr, nullptr, nullptr,
+    backend_name,
+    backend_free,
+    nullptr,
+    nullptr,
+    nullptr,
+    nullptr,
+    nullptr,
+    nullptr,
+    nullptr,
+    nullptr,
+    nullptr,
+    nullptr,
+    ggml_backend_aie2_graph_compute,
+    nullptr,
+    nullptr,
+    nullptr,
 };
 
 const char* dev_name(ggml_backend_dev_t /*dev*/) {
@@ -813,11 +1098,12 @@ void dev_props(ggml_backend_dev_t dev, ggml_backend_dev_props* props) {
     props->caps = {};
 }
 
-ggml_backend_t dev_init(ggml_backend_dev_t dev, const char* /*params*/) {
+ggml_backend_t ggml_backend_aie2_init(ggml_backend_dev_t dev, const char* /*params*/) {
     auto ops = get_ops();
     if (!ops) {
         return nullptr;
     }
+    XrtContextManager::instance().initialize(ops->artifacts_dir());
     auto* ctx = new BackendContext{std::move(ops)};
     static ggml_guid guid = {0x41, 0x49, 0x45, 0x32, 0x2d, 0x58, 0x52, 0x54,
                              0,    0,    0,    0,    0,    0,    0,    2};
@@ -825,20 +1111,22 @@ ggml_backend_t dev_init(ggml_backend_dev_t dev, const char* /*params*/) {
 }
 
 ggml_backend_buffer_type_t dev_buft(ggml_backend_dev_t /*dev*/) {
-    return ggml_backend_cpu_buffer_type();
-}
-
-bool dev_supports(ggml_backend_dev_t /*dev*/, const ggml_tensor* op) {
-    return op_supported(op);
+    return aie2_buft_ptr();
 }
 
 bool dev_supports_buft(ggml_backend_dev_t /*dev*/, ggml_backend_buffer_type_t buft) {
-    return ggml_backend_buft_is_host(buft);
+    return buft == aie2_buft_ptr() || ggml_backend_buft_is_host(buft);
 }
 
 const ggml_backend_device_i device_iface = {
-    dev_name, dev_description, dev_memory,        dev_type, dev_props, dev_init, dev_buft, nullptr,
-    nullptr,  dev_supports,    dev_supports_buft, nullptr,  nullptr,   nullptr,  nullptr,
+    dev_name,          dev_description,
+    dev_memory,        dev_type,
+    dev_props,         ggml_backend_aie2_init,
+    dev_buft,          nullptr,
+    nullptr,           ggml_backend_aie2_supports_op,
+    dev_supports_buft, nullptr,
+    nullptr,           nullptr,
+    nullptr,
 };
 
 const char* reg_name(ggml_backend_reg_t /*reg*/) {
