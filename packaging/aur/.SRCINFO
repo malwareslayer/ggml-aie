@@ -1,5 +1,5 @@
 pkgbase = ggml-aie
-	pkgdesc = Native GGML AIE2 backend for AMD XDNA1 NPU via XRT
+	pkgdesc = Tensor library for machine learning (with AMD XDNA/AIE2 NPU backend)
 	pkgver = 0.3.0
 	pkgrel = 1
 	url = https://github.com/malwareslayer/ggml-aie
