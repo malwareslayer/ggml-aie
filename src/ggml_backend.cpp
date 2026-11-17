@@ -211,6 +211,17 @@ int32_t unary_op_code(enum ggml_unary_op uop) {
 constexpr int kOpUnary = 92;
 constexpr int kOpGlu = 101;
 
+inline int normalize_ggml_op(enum ggml_op op) {
+    const int raw = static_cast<int>(op);
+    if (raw == kOpUnary) {
+        return static_cast<int>(GGML_OP_UNARY);
+    }
+    if (raw == kOpGlu) {
+        return static_cast<int>(GGML_OP_GLU);
+    }
+    return raw;
+}
+
 struct PackedWeight {
     std::vector<float> data;
     std::vector<uint16_t> data_bf16;
@@ -474,7 +485,7 @@ OllamaBufferType aie2_buffer_type_storage = {
 };
 
 bool is_npu_dma_op(const ggml_tensor* op) {
-    switch (static_cast<int>(op->op)) {
+    switch (normalize_ggml_op(op->op)) {
     case GGML_OP_MUL_MAT:
     case GGML_OP_NORM:
     case GGML_OP_RMS_NORM:
@@ -485,8 +496,7 @@ bool is_npu_dma_op(const ggml_tensor* op) {
     case GGML_OP_SCALE:
     case GGML_OP_DIV:
     case GGML_OP_UNARY:
-    case kOpUnary:
-    case kOpGlu:
+    case GGML_OP_GLU:
     case GGML_OP_SUM_ROWS:
     case GGML_OP_L2_NORM:
         return true;
@@ -519,7 +529,7 @@ int64_t min_gemm_m() {
 
 bool ggml_backend_aie2_supports_op(ggml_backend_dev_t /*dev*/, const ggml_tensor* op) {
     const int64_t M = op->ne[1];
-    switch (static_cast<int>(op->op)) {
+    switch (normalize_ggml_op(op->op)) {
     case GGML_OP_MUL_MAT: {
         if (M < min_gemm_m()) {
             return false;
@@ -561,10 +571,9 @@ bool ggml_backend_aie2_supports_op(ggml_backend_dev_t /*dev*/, const ggml_tensor
         return full_offload_enabled() && M > 1 && op->src[0]->type == GGML_TYPE_F32 &&
                op->src[1]->type == GGML_TYPE_F32 && ggml_nelements(op->src[1]) == 1;
     case GGML_OP_UNARY:
-    case kOpUnary:
         return full_offload_enabled() && M > 1 && op->src[0]->type == GGML_TYPE_F32 &&
                unary_op_code(ggml_get_unary_op(op)) >= 0;
-    case kOpGlu: {
+    case GGML_OP_GLU: {
         if (!full_offload_enabled() || M <= 1) {
             return false;
         }
@@ -613,7 +622,7 @@ void backend_free(ggml_backend_t backend) {
 }
 
 ggml_status compute_node(ggml_tensor* node) {
-    switch (static_cast<int>(node->op)) {
+    switch (normalize_ggml_op(node->op)) {
     case GGML_OP_NONE:
     case GGML_OP_RESHAPE:
     case GGML_OP_VIEW:
@@ -819,8 +828,7 @@ ggml_status compute_node(ggml_tensor* node) {
         }
         return GGML_STATUS_SUCCESS;
     }
-    case GGML_OP_UNARY:
-    case kOpUnary: {
+    case GGML_OP_UNARY: {
         const auto* src0 = node->src[0];
         const enum ggml_unary_op uop = ggml_get_unary_op(node);
         const int32_t code = unary_op_code(uop);
@@ -837,7 +845,7 @@ ggml_status compute_node(ggml_tensor* node) {
         XrtOpsRunner::unary_f32(in_ptr, static_cast<float*>(node->data), n, code);
         return GGML_STATUS_SUCCESS;
     }
-    case kOpGlu: {
+    case GGML_OP_GLU: {
         const auto* src0 = node->src[0];
         const auto* src1 = node->src[1];
         const enum ggml_glu_op glu = ggml_get_glu_op(node);
