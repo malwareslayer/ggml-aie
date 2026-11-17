@@ -213,6 +213,8 @@ constexpr int kOpGlu = 101;
 
 struct PackedWeight {
     std::vector<float> data;
+    std::vector<uint16_t> data_bf16;
+    bool is_bf16 = false;
     int64_t n_blocks = 0;
     int64_t k_blocks = 0;
     int64_t N = 0;
@@ -286,44 +288,65 @@ void ggml_backend_aie2_buffer_set_tensor(ggml_backend_buffer_t buffer, struct gg
 
     if (is_2d_weight) {
         const auto t0 = std::chrono::steady_clock::now();
-        constexpr int64_t TM = XrtOpsRunner::kGemmTM;
-        constexpr int64_t TK = XrtOpsRunner::kGemmTK;
-        constexpr int64_t TN_W = XrtOpsRunner::kGemmTNW;
-        constexpr int64_t NW = XrtOpsRunner::kGemmNW;
-        constexpr int64_t TN = XrtOpsRunner::kGemmTN;
-        constexpr auto kTileElems = static_cast<size_t>(TM * TK);
-        constexpr auto kBlockElems = static_cast<size_t>(NW) * kTileElems;
+        constexpr int64_t TK = XrtOpsRunner::kBf16TK;
+        constexpr int64_t KChunks = XrtOpsRunner::kBf16KChunks;
+        constexpr int64_t KSlice = XrtOpsRunner::kBf16KSlice;
+        constexpr int64_t TNW = XrtOpsRunner::kBf16TNW;
+        constexpr int64_t NW = XrtOpsRunner::kBf16NW;
+        constexpr int64_t TN = XrtOpsRunner::kBf16TN;
+        constexpr auto kTileElems = static_cast<size_t>(TNW * TK);
+        constexpr auto kColChunkElems = static_cast<size_t>(4) * kTileElems;
+        constexpr auto kColSliceElems = static_cast<size_t>(KChunks) * kColChunkElems;
+        constexpr auto kSliceElems = static_cast<size_t>(NW * KChunks) * kTileElems;
 
-        const int64_t n_blocks = (N + TN - 1) / TN;
-        const int64_t k_blocks = (K + TK - 1) / TK;
-        const size_t packed_elems = static_cast<size_t>(n_blocks * k_blocks) * kBlockElems;
-        const size_t packed_bytes = packed_elems * sizeof(float);
+        const int64_t n_slices = (N + TN - 1) / TN;
+        const int64_t k_slices = (K + KSlice - 1) / KSlice;
+        const size_t packed_elems = static_cast<size_t>(n_slices * k_slices) * kSliceElems;
+        const size_t packed_bytes = packed_elems * sizeof(uint16_t);
         const size_t prev = g_total_prepack_bytes.load(std::memory_order_relaxed);
         if (prev + packed_bytes > kMaxPrepackBytes) {
             return;
         }
 
         PackedWeight pw;
-        pw.data.assign(packed_elems, 0.0f);
-        pw.n_blocks = n_blocks;
-        pw.k_blocks = k_blocks;
+        pw.data_bf16.assign(packed_elems, uint16_t{0});
+        pw.is_bf16 = true;
+        pw.n_blocks = n_slices;
+        pw.k_blocks = k_slices;
         pw.N = N;
         pw.K = K;
+
+        const auto to_bf16 = [](float f) -> uint16_t {
+            uint32_t u = 0;
+            std::memcpy(&u, &f, sizeof(u));
+            u += 0x7FFFu + ((u >> 16U) & 1U);
+            return static_cast<uint16_t>(u >> 16U);
+        };
 
         std::vector<float> row_buf(static_cast<size_t>(K));
         for (int64_t n = 0; n < N; ++n) {
             read_row_f32(tensor, n, 0, 0, row_buf.data());
-            const int64_t nb_idx = n / TN;
-            const int64_t rem = n % TN;
-            const int64_t w = rem / TN_W;
-            const int64_t nl = rem % TN_W;
-            for (int64_t kb_idx = 0; kb_idx < k_blocks; ++kb_idx) {
-                const int64_t k0 = kb_idx * TK;
-                const int64_t kb = std::min<int64_t>(TK, K - k0);
-                float* dst = pw.data.data() +
-                             (static_cast<size_t>((nb_idx * k_blocks) + kb_idx) * kBlockElems) +
-                             (static_cast<size_t>(w) * kTileElems) + (static_cast<size_t>(nl) * TK);
-                std::memcpy(dst, row_buf.data() + k0, static_cast<size_t>(kb) * sizeof(float));
+            const int64_t ns = n / TN;
+            const int64_t n_rem = n % TN;
+            const int64_t w = n_rem / TNW;
+            const int64_t col = w / 4;
+            const int64_t row = w % 4;
+            const int64_t n_local = n_rem % TNW;
+            const int64_t n8 = n_local / 8;
+            const int64_t n_in = n_local % 8;
+            for (int64_t k = 0; k < K; ++k) {
+                const int64_t ks = k / KSlice;
+                const int64_t k_rem = k % KSlice;
+                const int64_t kc = k_rem / TK;
+                const int64_t k_local = k_rem % TK;
+                const int64_t k8 = k_local / 8;
+                const int64_t k_in = k_local % 8;
+                const size_t idx = (static_cast<size_t>((ns * k_slices) + ks) * kSliceElems) +
+                                   (static_cast<size_t>(col) * kColSliceElems) +
+                                   (static_cast<size_t>(kc) * kColChunkElems) +
+                                   (static_cast<size_t>(row) * kTileElems) +
+                                   static_cast<size_t>((((n8 * 8) + k8) * 64) + (k_in * 8) + n_in);
+                pw.data_bf16[idx] = to_bf16(row_buf[static_cast<size_t>(k)]);
             }
         }
         const auto t1 = std::chrono::steady_clock::now();
@@ -451,7 +474,7 @@ int64_t min_gemm_m() {
                 return static_cast<int64_t>(parsed);
             }
         }
-        return 64;
+        return 32;
     }();
     return val;
 }
@@ -872,8 +895,14 @@ ggml_status compute_node(ggml_tensor* node) {
                 auto* c_ptr = reinterpret_cast<float*>(static_cast<char*>(node->data) +
                                                        (i2 * node->nb[2]) + (i3 * node->nb[3]));
                 if (pw) {
-                    XrtOpsRunner::gemm_f32_nt_prepacked(a_ptr, K, pw->data.data(), pw->n_blocks,
-                                                        pw->k_blocks, c_ptr, N, M, N, K);
+                    if (pw->is_bf16) {
+                        XrtOpsRunner::gemm_bf16_nt_prepacked(a_ptr, K, pw->data_bf16.data(),
+                                                             pw->n_blocks, pw->k_blocks, c_ptr, N,
+                                                             M, N, K);
+                    } else {
+                        XrtOpsRunner::gemm_f32_nt_prepacked(a_ptr, K, pw->data.data(), pw->n_blocks,
+                                                            pw->k_blocks, c_ptr, N, M, N, K);
+                    }
                 } else {
                     const float* b_ptr = nullptr;
                     if (b_f32_contig) {

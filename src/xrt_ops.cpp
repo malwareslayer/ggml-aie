@@ -338,6 +338,121 @@ void XrtOpsRunner::gemm_f32_nt_prepacked(const float* a, int64_t lda, const floa
     }
 }
 
+namespace {
+uint16_t f32_to_bf16(float f) {
+    uint32_t u = 0;
+    std::memcpy(&u, &f, sizeof(u));
+    u += 0x7FFFu + ((u >> 16U) & 1U);
+    return static_cast<uint16_t>(u >> 16U);
+}
+
+float bf16_to_f32(uint16_t b) {
+    const uint32_t u = static_cast<uint32_t>(b) << 16U;
+    float f = 0.0f;
+    std::memcpy(&f, &u, sizeof(f));
+    return f;
+}
+} // namespace
+
+void XrtOpsRunner::gemm_bf16_nt_prepacked(const float* a, int64_t lda, const uint16_t* b_packed,
+                                          int64_t n_slices, int64_t k_slices, float* c, int64_t ldc,
+                                          int64_t M, int64_t N, int64_t K) {
+    auto& mgr = XrtContextManager::instance();
+    const std::scoped_lock lock(mgr.mutex());
+    auto& prog = mgr.slot(Aie2OpKind::kGemmBf16);
+
+    constexpr int64_t TM = kBf16TM;
+    constexpr int64_t TK = kBf16TK;
+    constexpr int64_t KChunks = kBf16KChunks;
+    constexpr int64_t KSlice = kBf16KSlice;
+    constexpr int64_t TNW = kBf16TNW;
+    constexpr int64_t NW = kBf16NW;
+    constexpr int64_t TN = kBf16TN;
+    constexpr auto kATileElems = static_cast<size_t>(TM * TK);
+    constexpr auto kASliceElems = static_cast<size_t>(KChunks) * kATileElems;
+    constexpr auto kBTileElems = static_cast<size_t>(TNW * TK);
+    constexpr auto kBSliceElems = static_cast<size_t>(NW * KChunks) * kBTileElems;
+
+    auto* a_buf = prog.arg_ptr<uint16_t>(0);
+    auto* b_buf = prog.arg_ptr<uint16_t>(1);
+    const auto* c_buf = prog.arg_ptr<uint16_t>(2);
+    auto& bo_a = prog.arg_bo(0);
+    auto& bo_b = prog.arg_bo(1);
+    auto& bo_c = prog.arg_bo(2);
+
+    std::vector<float> accum(static_cast<size_t>(M * N), 0.0f);
+    const int64_t m_strips = (M + TM - 1) / TM;
+    std::vector<uint16_t> a_packed(static_cast<size_t>(m_strips) * kASliceElems);
+
+    for (int64_t ks = 0; ks < k_slices; ++ks) {
+        const int64_t k_base = ks * KSlice;
+        std::ranges::fill(a_packed, uint16_t{0});
+        for (int64_t ms = 0; ms < m_strips; ++ms) {
+            const int64_t m0 = ms * TM;
+            const int64_t mb = std::min<int64_t>(TM, M - m0);
+            uint16_t* a_strip = a_packed.data() + (static_cast<size_t>(ms) * kASliceElems);
+            for (int64_t kc = 0; kc < KChunks; ++kc) {
+                const int64_t k0 = k_base + (kc * TK);
+                if (k0 >= K) {
+                    break;
+                }
+                uint16_t* a_chunk = a_strip + (static_cast<size_t>(kc) * kATileElems);
+                const int64_t kb = std::min<int64_t>(TK, K - k0);
+                for (int64_t m = 0; m < mb; ++m) {
+                    const int64_t m4 = m / 4;
+                    const int64_t r = m % 4;
+                    const float* src_row = a + ((m0 + m) * lda) + k0;
+                    for (int64_t k = 0; k < kb; ++k) {
+                        const int64_t k8 = k / 8;
+                        const int64_t c8 = k % 8;
+                        a_chunk[(((m4 * 8) + k8) * 32) + (r * 8) + c8] = f32_to_bf16(src_row[k]);
+                    }
+                }
+            }
+        }
+
+        for (int64_t ns = 0; ns < n_slices; ++ns) {
+            const int64_t n_base = ns * TN;
+            const int64_t nb = std::min<int64_t>(TN, N - n_base);
+            const uint16_t* b_src =
+                b_packed + (static_cast<size_t>((ns * k_slices) + ks) * kBSliceElems);
+            std::memcpy(b_buf, b_src, kBSliceElems * sizeof(uint16_t));
+            mgr.timed_sync(bo_b, XCL_BO_SYNC_BO_TO_DEVICE);
+
+            const int64_t active_w = (nb + TNW - 1) / TNW;
+            for (int64_t ms = 0; ms < m_strips; ++ms) {
+                const int64_t m0 = ms * TM;
+                const int64_t mb = std::min<int64_t>(TM, M - m0);
+                const uint16_t* a_strip =
+                    a_packed.data() + (static_cast<size_t>(ms) * kASliceElems);
+                std::memcpy(a_buf, a_strip, kASliceElems * sizeof(uint16_t));
+                mgr.timed_sync(bo_a, XCL_BO_SYNC_BO_TO_DEVICE);
+                mgr.timed_run_wait(prog, bo_a, bo_b, bo_c);
+                mgr.timed_sync(bo_c, XCL_BO_SYNC_BO_FROM_DEVICE);
+
+                for (int64_t w = 0; w < active_w; ++w) {
+                    const int64_t wn0 = n_base + (w * TNW);
+                    const int64_t wnb = std::min<int64_t>(TNW, N - wn0);
+                    const uint16_t* cw = c_buf + (static_cast<size_t>(w) * kATileElems);
+                    for (int64_t m = 0; m < mb; ++m) {
+                        const int64_t m4 = m / 4;
+                        const int64_t r = m % 4;
+                        float* acc_row = accum.data() + ((m0 + m) * N) + wn0;
+                        for (int64_t n = 0; n < wnb; ++n) {
+                            const int64_t n8 = n / 8;
+                            const int64_t c8 = n % 8;
+                            acc_row[n] += bf16_to_f32(cw[(((m4 * 8) + n8) * 32) + (r * 8) + c8]);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    for (int64_t m = 0; m < M; ++m) {
+        std::memcpy(c + (m * ldc), accum.data() + (m * N), static_cast<size_t>(N) * sizeof(float));
+    }
+}
+
 void XrtOpsRunner::l2_norm_f32(const float* in, float* out, int64_t n_vecs, int64_t len,
                                float eps) {
     if (len <= 0 || len > 4096) {

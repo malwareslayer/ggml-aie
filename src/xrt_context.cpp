@@ -55,6 +55,9 @@ XrtContextManager::ProgramSlot& XrtContextManager::slot(Aie2OpKind kind) {
     };
 
     constexpr size_t kGemmTileBytes = static_cast<size_t>(64) * 64U * sizeof(float);
+    constexpr size_t kBf16ABytes = static_cast<size_t>(16) * 32U * 64U * sizeof(uint16_t);
+    constexpr size_t kBf16BBytes = static_cast<size_t>(16) * 16U * 64U * 64U * sizeof(uint16_t);
+    constexpr size_t kBf16CBytes = static_cast<size_t>(16) * 32U * 64U * sizeof(uint16_t);
     constexpr size_t kVecBytes = static_cast<size_t>(4096) * sizeof(float);
     constexpr size_t kAuxLargeBytes = static_cast<size_t>(4112) * sizeof(float);
     constexpr size_t kAuxSmallBytes = static_cast<size_t>(16) * sizeof(float);
@@ -68,6 +71,7 @@ XrtContextManager::ProgramSlot& XrtContextManager::slot(Aie2OpKind kind) {
         {Aie2OpKind::kEltwise, "eltwise", {kVecBytes, kAuxLargeBytes, kVecBytes}},
         {Aie2OpKind::kUnary, "unary", {kVecBytes, kVecBytes, kAuxSmallBytes}},
         {Aie2OpKind::kL2Norm, "l2_norm", {kVecBytes, kVecBytes, kAuxSmallBytes}},
+        {Aie2OpKind::kGemmBf16, "gemm_bf16", {kBf16ABytes, kBf16BBytes, kBf16CBytes}},
     }};
 
     const auto& spec = kSpecs[static_cast<size_t>(kind)];

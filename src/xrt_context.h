@@ -20,7 +20,8 @@ enum class Aie2OpKind : uint8_t {
     kEltwise = 3,
     kUnary = 4,
     kL2Norm = 5,
-    kCount = 6,
+    kGemmBf16 = 6,
+    kCount = 7,
 };
 
 class XrtContextManager {

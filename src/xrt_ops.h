@@ -11,6 +11,14 @@ class XrtOpsRunner {
     static constexpr int64_t kGemmNW = 4;
     static constexpr int64_t kGemmTN = kGemmTNW * kGemmNW; // 256
 
+    static constexpr int64_t kBf16TM = 32;
+    static constexpr int64_t kBf16TK = 64;
+    static constexpr int64_t kBf16KChunks = 16;
+    static constexpr int64_t kBf16KSlice = kBf16TK * kBf16KChunks; // 1024
+    static constexpr int64_t kBf16TNW = 64;
+    static constexpr int64_t kBf16NW = 16;
+    static constexpr int64_t kBf16TN = kBf16TNW * kBf16NW; // 1024
+
     explicit XrtOpsRunner(std::string artifacts_dir);
 
     [[nodiscard]] const std::string& artifacts_dir() const {
@@ -42,6 +50,12 @@ class XrtOpsRunner {
     static void gemm_f32_nt_prepacked(const float* a, int64_t lda, const float* b_packed,
                                       int64_t n_blocks, int64_t k_blocks, float* c, int64_t ldc,
                                       int64_t M, int64_t N, int64_t K);
+
+    // Computes C[M, N] = A[M, K] * B^T[K, N] on 4-column BF16 aie::mmul<4,8,8> NPU kernel.
+    // b_packed is [n_slices][k_slices][4_col][16_kchunk][4_row][8_n8][8_k8][8_kin][8_nin] uint16.
+    static void gemm_bf16_nt_prepacked(const float* a, int64_t lda, const uint16_t* b_packed,
+                                       int64_t n_slices, int64_t k_slices, float* c, int64_t ldc,
+                                       int64_t M, int64_t N, int64_t K);
 
     static void l2_norm_f32(const float* in, float* out, int64_t n_vecs, int64_t len, float eps);
 
