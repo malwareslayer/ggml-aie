@@ -1,4 +1,5 @@
 #include "xrt_matmul.h"
+#include "xrt_context.h"
 #include <algorithm>
 #include <bit>
 #include <chrono>
@@ -118,10 +119,14 @@ struct Matmul::Fixture {
     Fixture(const std::filesystem::path& dir, Shape s, size_t capacity)
         : shape(s), rows(capacity),
           instruction_data(read_instructions(dir / (std::string(s.name) + ".insts.txt"))),
-          binary(load_binary(dir / (std::string(s.name) + ".xclbin"))), device(0),
-          context(device, device.register_xclbin(binary)), kernel(context, "MLIR_AIE"),
-          instructions(device, instruction_data.size(), xrt::bo::flags::cacheable,
-                       kernel.group_id(1)),
+          binary(load_binary(dir / (std::string(s.name) + ".xclbin"))), device(0), context([&]() {
+              const auto qos = build_aie2_qos_config();
+              const auto uuid = device.register_xclbin(binary);
+              return qos.empty() ? xrt::hw_context(device, uuid)
+                                 : xrt::hw_context(device, uuid, qos);
+          }()),
+          kernel(context, "MLIR_AIE"), instructions(device, instruction_data.size(),
+                                                    xrt::bo::flags::cacheable, kernel.group_id(1)),
           a(device, rows * static_cast<size_t>(s.k) * sizeof(uint16_t), xrt::bo::flags::host_only,
             kernel.group_id(3)),
           b(device, static_cast<size_t>(s.k * s.n) * sizeof(uint16_t), xrt::bo::flags::host_only,

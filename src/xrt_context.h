@@ -2,6 +2,7 @@
 
 #include <xrt/xrt_bo.h>
 #include <xrt/xrt_device.h>
+#include <xrt/xrt_hw_context.h>
 #include <xrt/xrt_kernel.h>
 
 #include <array>
@@ -114,3 +115,4 @@ class XrtContextManager {
 };
 
 std::vector<uint32_t> load_xrt_insts_bin(const std::string& path);
+xrt::hw_context::cfg_param_type build_aie2_qos_config();

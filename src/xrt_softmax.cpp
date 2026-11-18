@@ -1,4 +1,5 @@
 #include "xrt_softmax.h"
+#include "xrt_context.h"
 
 #include <algorithm>
 #include <bit>
@@ -40,8 +41,13 @@ struct Softmax::Impl {
     xrt::bo instructions, input, output;
 
     explicit Impl(const std::filesystem::path& dir)
-        : instructions_data(read_file(dir / "insts.bin")), device(0),
-          context(device, device.register_xclbin(xrt::xclbin((dir / "softmax.xclbin").string()))),
+        : instructions_data(read_file(dir / "insts.bin")), device(0), context([&]() {
+              const auto qos = build_aie2_qos_config();
+              const auto uuid =
+                  device.register_xclbin(xrt::xclbin((dir / "softmax.xclbin").string()));
+              return qos.empty() ? xrt::hw_context(device, uuid)
+                                 : xrt::hw_context(device, uuid, qos);
+          }()),
           kernel(context, "MLIR_AIE"), instructions(device, instructions_data.size(),
                                                     xrt::bo::flags::cacheable, kernel.group_id(1)),
           input(device, tile_size * sizeof(uint16_t), xrt::bo::flags::host_only,

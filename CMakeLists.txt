@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(ggml-aie VERSION 0.3.2 LANGUAGES CXX)
+project(ggml-aie VERSION 0.3.3 LANGUAGES CXX)
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 

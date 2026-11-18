@@ -1,10 +1,89 @@
 #include "xrt_context.h"
 
+#include <algorithm>
+#include <cctype>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <stdexcept>
+#include <string_view>
 
 namespace fs = std::filesystem;
+
+namespace {
+
+uint32_t parse_u32_env(const char* name, uint32_t default_val) {
+    const char* raw = std::getenv(name);
+    if (!raw || *raw == '\0') {
+        return default_val;
+    }
+    char* end = nullptr;
+    const unsigned long parsed = std::strtoul(raw, &end, 0);
+    if (end == raw || *end != '\0' || parsed > std::numeric_limits<uint32_t>::max()) {
+        return default_val;
+    }
+    return static_cast<uint32_t>(parsed);
+}
+
+uint32_t parse_priority_env(const char* name, uint32_t default_val) {
+    const char* raw = std::getenv(name);
+    if (!raw || *raw == '\0') {
+        return default_val;
+    }
+    std::string lower(raw);
+    std::transform(lower.begin(), lower.end(), lower.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    struct NamedPriority {
+        std::string_view key;
+        uint32_t value;
+    };
+    constexpr std::array<NamedPriority, 6> kNamed = {{
+        {"realtime", 0x100U},
+        {"high", 0x180U},
+        {"normal", 0x200U},
+        {"low", 0x280U},
+        {"none", 0U},
+        {"unset", 0U},
+    }};
+    for (const auto& entry : kNamed) {
+        if (lower == entry.key) {
+            return entry.value;
+        }
+    }
+    return parse_u32_env(name, default_val);
+}
+
+} // namespace
+
+xrt::hw_context::cfg_param_type build_aie2_qos_config() {
+    xrt::hw_context::cfg_param_type qos;
+    const uint32_t priority = parse_priority_env("AIE2_QOS_PRIORITY", 0x200U);
+    const uint32_t gops = parse_u32_env("AIE2_QOS_GOPS", 4000U);
+    const uint32_t latency = parse_u32_env("AIE2_QOS_LATENCY", 1000U);
+    const uint32_t fps = parse_u32_env("AIE2_QOS_FPS", 0U);
+    const uint32_t dma_bw = parse_u32_env("AIE2_QOS_DMA_BW", 0U);
+    const uint32_t frame_exec = parse_u32_env("AIE2_QOS_FRAME_EXEC_TIME", 0U);
+    if (priority > 0U) {
+        qos["priority"] = priority;
+    }
+    if (gops > 0U) {
+        qos["gops"] = gops;
+    }
+    if (latency > 0U) {
+        qos["latency"] = latency;
+    }
+    if (fps > 0U) {
+        qos["fps"] = fps;
+    }
+    if (dma_bw > 0U) {
+        qos["dma_bandwidth"] = dma_bw;
+    }
+    if (frame_exec > 0U) {
+        qos["frame_execution_time"] = frame_exec;
+    }
+    return qos;
+}
 
 std::vector<uint32_t> load_xrt_insts_bin(const std::string& path) {
     std::ifstream ifs(path, std::ios::binary | std::ios::ate);
@@ -84,7 +163,9 @@ XrtContextManager::ProgramSlot& XrtContextManager::slot(Aie2OpKind kind) {
     const auto insts = load_xrt_insts_bin(insts_path);
     const xrt::xclbin xb(xclbin_path);
     prog.uuid = device_.register_xclbin(xb);
-    prog.hw_ctx = xrt::hw_context(device_, prog.uuid);
+    const auto qos = build_aie2_qos_config();
+    prog.hw_ctx = qos.empty() ? xrt::hw_context(device_, prog.uuid)
+                              : xrt::hw_context(device_, prog.uuid, qos);
     prog.kernel = xrt::kernel(prog.hw_ctx, "MLIR_AIE");
     prog.insts_count = static_cast<uint32_t>(insts.size());
     prog.insts_bo = xrt::bo(device_, insts.size() * sizeof(uint32_t), XCL_BO_FLAGS_CACHEABLE,
